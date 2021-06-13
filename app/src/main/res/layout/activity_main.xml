@@ -11,21 +11,24 @@
     <com.google.android.material.appbar.AppBarLayout
         android:id="@+id/appbar"
         android:layout_width="match_parent"
-        android:layout_height="wrap_content"
-        android:theme="@style/ThemeOverlay.AppCompat.Dark.ActionBar">
+        android:layout_height="wrap_content">
 
-        <androidx.appcompat.widget.Toolbar
+        <com.google.android.material.appbar.MaterialToolbar
             android:id="@+id/toolbar"
             android:layout_width="match_parent"
             android:layout_height="?attr/actionBarSize"
             app:layout_collapseMode="pin"
-            app:layout_scrollFlags="scroll|enterAlways|enterAlwaysCollapsed" />
+            app:layout_scrollFlags="scroll|enterAlways|enterAlwaysCollapsed"
+            app:logo="@mipmap/ic_launcher_round_icon"
+            app:title="@string/app_name"
+            tools:menu="@menu/menu_main" />
 
         <com.google.android.material.tabs.TabLayout
             android:id="@+id/tab"
             android:layout_width="wrap_content"
             android:layout_height="wrap_content"
             app:layout_scrollFlags="enterAlways"
+            app:tabIndicatorColor="@color/accent"
             app:tabMode="scrollable" />
     </com.google.android.material.appbar.AppBarLayout>
 

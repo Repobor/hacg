@@ -5,23 +5,25 @@ package io.github.yueeng.hacg
 import android.annotation.SuppressLint
 import android.app.Activity
 import android.app.Application
-import android.content.*
+import android.content.ClipData
+import android.content.ClipboardManager
+import android.content.Context
+import android.content.Intent
 import android.graphics.Canvas
 import android.graphics.Paint
 import android.graphics.RectF
+import android.graphics.drawable.Drawable
 import android.net.Uri
-import android.os.Build
 import android.os.Bundle
 import android.os.Parcelable
-import android.provider.Settings
 import android.text.SpannableStringBuilder
 import android.text.Spanned
 import android.text.TextPaint
 import android.text.style.ClickableSpan
 import android.text.style.ReplacementSpan
 import android.util.AttributeSet
-import android.util.DisplayMetrics
 import android.view.*
+import android.webkit.CookieManager
 import android.widget.FrameLayout
 import android.widget.Toast
 import androidx.appcompat.app.AppCompatActivity
@@ -29,56 +31,99 @@ import androidx.coordinatorlayout.widget.CoordinatorLayout
 import androidx.core.content.ContextCompat
 import androidx.core.os.LocaleListCompat
 import androidx.core.text.HtmlCompat
+import androidx.core.view.children
 import androidx.fragment.app.Fragment
-import androidx.recyclerview.widget.GridLayoutManager
-import androidx.recyclerview.widget.LinearLayoutManager
-import androidx.recyclerview.widget.RecyclerView
-import androidx.recyclerview.widget.StaggeredGridLayoutManager
+import androidx.lifecycle.MutableLiveData
+import androidx.lifecycle.SavedStateHandle
+import androidx.paging.PagingSource
+import androidx.preference.PreferenceManager
+import androidx.recyclerview.widget.*
 import androidx.slidingpanelayout.widget.SlidingPaneLayout
+import com.bumptech.glide.Glide
+import com.bumptech.glide.GlideBuilder
+import com.bumptech.glide.Registry
+import com.bumptech.glide.annotation.Excludes
+import com.bumptech.glide.annotation.GlideModule
+import com.bumptech.glide.integration.okhttp3.OkHttpUrlLoader
+import com.bumptech.glide.load.DecodeFormat
+import com.bumptech.glide.load.model.GlideUrl
+import com.bumptech.glide.load.resource.drawable.DrawableTransitionOptions
+import com.bumptech.glide.module.AppGlideModule
+import com.bumptech.glide.request.RequestOptions
+import com.github.clans.fab.FloatingActionButton
+import com.github.clans.fab.FloatingActionMenu
 import com.google.android.material.snackbar.Snackbar
 import com.google.gson.Gson
 import com.google.gson.GsonBuilder
 import com.gun0912.tedpermission.PermissionListener
 import com.gun0912.tedpermission.TedPermission
-import com.jakewharton.picasso.OkHttp3Downloader
-import com.squareup.picasso.Picasso
-import okhttp3.MultipartBody
-import okhttp3.OkHttpClient
-import okhttp3.Request
+import kotlinx.coroutines.async
+import kotlinx.coroutines.awaitAll
+import kotlinx.coroutines.channels.Channel
+import kotlinx.coroutines.coroutineScope
+import kotlinx.coroutines.flow.consumeAsFlow
+import kotlinx.coroutines.suspendCancellableCoroutine
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
+import kotlinx.parcelize.Parcelize
+import okhttp3.*
 import okhttp3.logging.HttpLoggingInterceptor
 import okio.buffer
 import okio.sink
-import org.jetbrains.anko.AnkoAsyncContext
-import org.jetbrains.anko.childrenRecursiveSequence
-import org.jetbrains.anko.doAsync
-import org.jetbrains.anko.doAsyncResult
 import org.jsoup.Jsoup
 import org.jsoup.nodes.Document
 import java.io.File
-import java.net.*
+import java.io.IOException
+import java.io.InputStream
+import java.net.InetAddress
+import java.net.InetSocketAddress
+import java.net.Socket
 import java.text.ParseException
 import java.text.SimpleDateFormat
 import java.util.*
-import java.util.concurrent.Future
 import java.util.concurrent.TimeUnit
-import kotlin.math.min
+import kotlin.coroutines.resume
+import kotlin.coroutines.resumeWithException
 import kotlin.math.roundToInt
 
 fun debug(call: () -> Unit) {
     if (BuildConfig.DEBUG) call()
 }
 
+var user: Int
+    get() = PreferenceManager.getDefaultSharedPreferences(HAcgApplication.instance).getInt("user.id", 0)
+    set(value) = PreferenceManager.getDefaultSharedPreferences(HAcgApplication.instance).edit().putInt("user.id", value).apply()
+
 val gson: Gson = GsonBuilder().create()
 val okhttp = OkHttpClient.Builder()
         .connectTimeout(10, TimeUnit.SECONDS)
         .writeTimeout(20, TimeUnit.SECONDS)
         .readTimeout(30, TimeUnit.SECONDS)
+        .cache(Cache(HAcgApplication.instance.cacheDir, 1024 * 1024 * 256))
+        .cookieJar(WebkitCookieJar(CookieManager.getInstance()))
         .apply { debug { addInterceptor(HttpLoggingInterceptor().apply { level = HttpLoggingInterceptor.Level.BASIC }) } }
         .build()
 val okdownload = OkHttpClient.Builder()
         .connectTimeout(10, TimeUnit.SECONDS)
+        .cache(Cache(HAcgApplication.instance.cacheDir, 1024 * 1024 * 256))
+        .cookieJar(WebkitCookieJar(CookieManager.getInstance()))
         .apply { debug { addInterceptor(HttpLoggingInterceptor().apply { level = HttpLoggingInterceptor.Level.BASIC }) } }
         .build()
+
+@GlideModule
+@Excludes(com.bumptech.glide.integration.okhttp3.OkHttpLibraryGlideModule::class)
+class HacgAppGlideModule : AppGlideModule() {
+    override fun applyOptions(context: Context, builder: GlideBuilder) {
+        builder.setDefaultRequestOptions(RequestOptions().format(DecodeFormat.PREFER_RGB_565))
+    }
+
+    override fun registerComponents(context: Context, glide: Glide, registry: Registry) {
+        registry.replace(GlideUrl::class.java, InputStream::class.java, OkHttpUrlLoader.Factory(okhttp))
+    }
+}
+
+fun GlideRequest<Drawable>.crossFade(): GlideRequest<Drawable> =
+        this.transition(DrawableTransitionOptions.withCrossFade())
 
 class HAcgApplication : Application() {
     companion object {
@@ -91,151 +136,31 @@ class HAcgApplication : Application() {
     init {
         _instance = this
     }
+}
 
-    override fun onCreate() {
-        super.onCreate()
-        Picasso.setSingletonInstance(Picasso.Builder(this)
-                .downloader(OkHttp3Downloader(okhttp))
-                .build())
-        CookieHandler.setDefault(CookieManagerProxy.instance)
+class WebkitCookieJar(private val cm: CookieManager) : CookieJar {
+    override fun loadForRequest(url: HttpUrl): List<Cookie> = cm.getCookie(url.toString())?.split("; ")?.mapNotNull { Cookie.parse(url, it) }?.toList() ?: emptyList()
+
+    override fun saveFromResponse(url: HttpUrl, cookies: List<Cookie>) {
+        cookies.forEach { cookie ->
+            cm.setCookie(url.toString(), cookie.toString())
+        }
     }
 }
 
-class CookieManagerProxy(store: CookieStore, policy: CookiePolicy) : CookieManager(store, policy) {
-
-    private val SetCookie: String = "Set-Cookie"
-
-    override fun put(uri: URI, headers: Map<String, List<String>>) {
-        super.put(uri, headers)
-        cookieStore.get(uri)
-                .filter { o -> o.domain != null && !o.domain.startsWith(".") }
-                .forEach { o -> o.domain = ".${o.domain}" }
+suspend fun <T> Call.await(action: (Call, Response) -> T): T = suspendCancellableCoroutine { continuation ->
+    continuation.invokeOnCancellation {
+        cancel()
     }
-
-    fun put(uri: URI, cookies: String?) = when (cookies) {
-        null -> {
-        }
-        else ->
-            this.put(uri, mapOf(SetCookie to cookies.split(";").map { it.trim() }.toList()))
-    }
-
-    companion object {
-        val instance = CookieManagerProxy(PersistCookieStore(HAcgApplication.instance), CookiePolicy.ACCEPT_ALL)
-    }
-}
-
-/**
- * PersistentCookieStore
- * Created by Rain on 2015/7/1.
- */
-class PersistCookieStore(context: Context) : CookieStore {
-    private val map = mutableMapOf<URI, MutableSet<HttpCookie>>()
-    private val pref: SharedPreferences = context.getSharedPreferences("cookies.pref", Context.MODE_PRIVATE)
-
-    init {
-        pref.all.mapNotNull { i -> (i.value as? String)?.takeIf { it.isNotEmpty() }?.let { i.key to it.split(',') } }
-                .forEach { o ->
-                    map[URI.create(o.first)] = o.second.flatMap { c ->
-                        try {
-                            HttpCookie.parse(c)
-                        } catch (_: Throwable) {
-                            listOf<HttpCookie>()
-                        }
-                    }.toMutableSet()
-                }
-    }
-
-    fun HttpCookie.string(): String {
-        if (version != 0) {
-            return toString()
-        }
-        return mapOf(name to value, "domain" to domain)
-                .filter { it.value != null }
-                .filter { it.value.isNotEmpty() }
-                .map { o -> "${o.key}=${o.value}" }
-                .joinToString("; ")
-    }
-
-    private fun cookiesUri(uri: URI): URI {
-        return try {
-            URI("http", uri.host, null, null)
-        } catch (_: URISyntaxException) {
-            uri
-        }
-    }
-
-    @Synchronized
-    override fun add(url: URI, cookie: HttpCookie?) {
-        if (cookie == null) {
-            throw NullPointerException("cookie == null")
-        }
-        cookie.domain?.takeIf { !it.startsWith(".") }?.let { cookie.domain = ".$it" }
-
-        val uri = cookiesUri(url)
-
-        if (map.contains(uri)) {
-            map[uri]!!.add(cookie)
-        } else {
-            map[uri] = mutableSetOf(cookie)
+    enqueue(object : Callback {
+        override fun onFailure(call: Call, e: IOException) {
+            if (!continuation.isCancelled) continuation.resumeWithException(e)
         }
 
-        pref.edit().putString(uri.toString(), map[uri]!!.map { it.string() }.toSet().joinToString(",")).apply()
-    }
-
-    @Synchronized
-    override fun remove(url: URI, cookie: HttpCookie?): Boolean {
-        if (cookie == null) {
-            throw NullPointerException("cookie == null")
+        override fun onResponse(call: Call, response: Response) {
+            if (!continuation.isCancelled) continuation.resume(action(call, response))
         }
-        val uri = cookiesUri(url)
-        return map[uri]?.takeIf { it.contains(cookie) }?.let { cookies ->
-            pref.edit().putString(uri.toString(), (cookies - cookie).map { it.string() }.toSet().joinToString(",")).apply()
-            true
-        } ?: false
-    }
-
-    @Synchronized
-    override fun removeAll(): Boolean {
-        val result = map.isNotEmpty()
-        map.clear()
-        pref.edit().clear().apply()
-        return result
-    }
-
-    @Synchronized
-    override fun getURIs(): List<URI> =
-            map.keys.toList()
-
-
-    private fun expire(uri: URI, cookies: MutableSet<HttpCookie>, edit: SharedPreferences.Editor, fn: (HttpCookie) -> Boolean = { true }) {
-        cookies.filter(fn).filter { it.hasExpired() }.takeIf { it.isNotEmpty() }?.let { ex ->
-            cookies.removeAll(ex)
-            edit.putString(uri.toString(), cookies.map { it.string() }.toSet().joinToString(",")).apply()
-        }
-    }
-
-    @Synchronized
-    override fun getCookies(): List<HttpCookie> {
-        pref.edit().apply { map.forEach { expire(it.key, it.value, this) } }.apply()
-        return map.values.flatten().toList().distinct()
-    }
-
-    @Synchronized
-    override fun get(uri: URI?): List<HttpCookie> {
-        if (uri == null) {
-            throw NullPointerException("uri == null")
-        }
-        val edit = pref.edit()
-        return map[uri]?.let { cookies ->
-            expire(uri, cookies, edit)
-            map.filter { it.key != uri }.forEach { o ->
-                expire(o.key, o.value, edit) { c -> HttpCookie.domainMatches(c.domain, uri.host) }
-            }
-            edit.apply()
-            (map[uri]?.toList()
-                    ?: listOf()) + map.values.flatMap { o -> o.filter { c -> HttpCookie.domainMatches(c.domain, uri.host) } }.toList().distinct()
-        } ?: listOf()
-    }
+    })
 }
 
 val datefmt get() = SimpleDateFormat("yyyy-MM-dd'T'hh:mm:ssZZZZZ", LocaleListCompat.getDefault()[0])
@@ -247,9 +172,29 @@ fun String.toDate(fmt: SimpleDateFormat? = null): Date? = try {
 }
 
 val String.html: Spanned get() = HtmlCompat.fromHtml(this, HtmlCompat.FROM_HTML_MODE_COMPACT)
+fun String.isSameHost(base: String?) = try {
+    if (base != null) Uri.parse(this).host == Uri.parse(base).host else false
+} catch (_: Exception) {
+    false
+}
 
-fun openWeb(context: Context, uri: String): Unit =
-        context.startActivity(Intent(Intent.ACTION_VIEW, Uri.parse(uri)).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK))
+val String.isWordpress
+    get() = try {
+        Uri.parse(this).path?.startsWith("/wp/") ?: false
+    } catch (_: Exception) {
+        false
+    }
+
+fun Context.openUri(url: String?, web: Boolean = true): Boolean = when {
+    url.isNullOrEmpty() -> null
+    !url.isWordpress -> Uri.parse(url).let { uri ->
+        startActivity(Intent.createChooser(Intent(Intent.ACTION_VIEW, uri).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK), uri.scheme))
+    }
+    Article.getIdFromUrl(url) != null -> startActivity(Intent(this, InfoActivity::class.java).putExtra("url", url))
+    Article.isList(url) -> startActivity(Intent(this, ListActivity::class.java).putExtra("url", url))
+    web -> startActivity(Intent(this, WebActivity::class.java).putExtra("url", url))
+    else -> null
+} != null
 
 val random = Random(System.currentTimeMillis())
 
@@ -269,61 +214,105 @@ fun Context.clipboard(label: String, text: String) {
 fun ViewGroup.inflate(layout: Int, attach: Boolean = false): View =
         LayoutInflater.from(this.context).inflate(layout, this, attach)
 
-private val img = listOf(".jpg", ".png", ".webp")
-@SuppressLint("DefaultLocale")
-fun String.isImg(): Boolean = img.any { this.toLowerCase().endsWith(it) }
+fun View.childrenSequence(): Sequence<View> = (this as? ViewGroup)?.children ?: emptySequence()
+fun View.childrenRecursiveSequence(): Sequence<View> = ViewChildrenRecursiveSequence(this)
+private class ViewChildrenRecursiveSequence(private val view: View) : Sequence<View> {
+    override fun iterator(): Iterator<View> {
+        if (view !is ViewGroup) return emptyList<View>().iterator()
+        return RecursiveViewIterator(view)
+    }
 
-fun String.httpGet(): Pair<String, String>? = try {
+    private class RecursiveViewIterator(view: View) : Iterator<View> {
+        private val sequences = arrayListOf(view.childrenSequence())
+        private var current = sequences.removeLast().iterator()
+
+        override fun next(): View {
+            if (!hasNext()) throw NoSuchElementException()
+            val view = current.next()
+            if (view is ViewGroup && view.childCount > 0) {
+                sequences.add(view.childrenSequence())
+            }
+            return view
+        }
+
+        override fun hasNext(): Boolean {
+            if (!current.hasNext() && sequences.isNotEmpty()) {
+                current = sequences.removeLast().iterator()
+            }
+            return current.hasNext()
+        }
+
+        @Suppress("NOTHING_TO_INLINE")
+        private inline fun <T : Any> MutableList<T>.removeLast(): T {
+            if (isEmpty()) throw NoSuchElementException()
+            return removeAt(size - 1)
+        }
+    }
+}
+
+fun FloatingActionButton.setRandomColor(): FloatingActionButton = apply {
+    colorNormal = randomColor()
+    colorPressed = randomColor()
+    colorRipple = randomColor()
+}
+
+fun FloatingActionMenu.setRandomColor(): FloatingActionMenu = apply {
+    menuButtonColorNormal = randomColor()
+    menuButtonColorPressed = randomColor()
+    menuButtonColorRipple = randomColor()
+}
+
+private val img = listOf(".jpg", ".png", ".webp")
+
+@SuppressLint("DefaultLocale")
+fun String.isImg(): Boolean = img.any { this.lowercase(Locale.getDefault()).endsWith(it) }
+
+suspend fun String.httpGetAwait(): Pair<String, String>? = try {
     val request = Request.Builder().get().url(this).build()
-    val response = okhttp.newCall(request).execute()
-    response.body!!.string() to response.request.url.toString()
+    val (html, url) = okhttp.newCall(request).await { _, response -> response.body!!.string() to response.request.url.toString() }
+    if (url.startsWith(HAcg.wordpress)) {
+        """"user_id":"(\d+)"""".toRegex().find(html)?.let {
+            user = it.groups[1]?.value?.toIntOrNull() ?: 0
+        }
+    }
+    html to url
 } catch (e: Exception) {
     e.printStackTrace(); null
 }
 
-fun String.httpGetAsync(context: Context, callback: (Pair<String, String>?) -> Unit): Future<Unit> = context.doAsync {
-    val result = this@httpGetAsync.httpGet()
-    autoUiThread { callback(result) }
-}
-
-fun String.httpPost(post: Map<String, String>): Pair<String, String>? = try {
-    val data = post.asSequence().fold(MultipartBody.Builder().setType(MultipartBody.FORM)) { b, o -> b.addFormDataPart(o.key, o.value) }.build()
+suspend fun String.httpPostAwait(post: Map<String, String>): Pair<String, String>? = try {
+    val data = post.toList().fold(MultipartBody.Builder().setType(MultipartBody.FORM)) { b, o -> b.addFormDataPart(o.first, o.second) }.build()
     val request = Request.Builder().url(this).post(data).build()
-    val response = okhttp.newCall(request).execute()
-    (response.body!!.string() to response.request.url.toString())
+    val response = okhttp.newCall(request).await { _, response ->
+        (response.body!!.string() to response.request.url.toString())
+    }
+    response
 } catch (_: Exception) {
     null
 }
 
-fun String.httpDownloadAsync(context: Context, file: String? = null, fn: (File?) -> Unit): Future<Unit> = context.doAsync {
-    val result = httpDownload(file)
-    autoUiThread { fn(result) }
-}
-
-fun String.httpDownload(file: String? = null): File? = try {
+suspend fun String.httpDownloadAwait(file: String? = null): File? = try {
     val request = Request.Builder().get().url(this).build()
-    val response = okdownload.newCall(request).execute()
-
-    val target = if (file == null) {
-        val path = response.request.url.toUri().path
-        File(HAcgApplication.instance.externalCacheDir, path.substring(path.lastIndexOf('/') + 1))
-    } else {
-        File(file)
+    okdownload.newCall(request).await { _, response ->
+        val target = if (file == null) {
+            val path = response.request.url.toUri().path
+            File(HAcgApplication.instance.externalCacheDir, path.substring(path.lastIndexOf('/') + 1))
+        } else {
+            File(file)
+        }
+        val sink = target.sink().buffer()
+        sink.writeAll(response.body!!.source())
+        sink.close()
+        target
     }
-
-    val sink = target.sink().buffer()
-    sink.writeAll(response.body!!.source())
-    sink.close()
-    target
 } catch (e: Exception) {
     e.printStackTrace(); null
 }
 
 fun String.test(timeout: Int = 1000): Pair<Boolean, Int> = try {
-    val uri = URL("https://$this")
+    val uri = Uri.parse("https://$this")
     (Socket()).use { socket ->
-        val address = InetSocketAddress(InetAddress.getByName(uri.host), uri.port.takeIf { it != -1 }
-                ?: 80)
+        val address = InetSocketAddress(InetAddress.getByName(uri.host), uri.port.takeIf { it > 0 } ?: 443)
         val begin = System.currentTimeMillis()
         socket.connect(address, timeout)
         (socket.isConnected to (System.currentTimeMillis() - begin).toInt())
@@ -332,47 +321,34 @@ fun String.test(timeout: Int = 1000): Pair<Boolean, Int> = try {
     e.printStackTrace(); (false to 0)
 }
 
+val rmagnet = """\b([a-zA-Z0-9]{32}|[a-zA-Z0-9]{40})\b""".toRegex()
+val rbaidu = """\b([a-zA-Z0-9]{8})\b\s+\b([a-zA-Z0-9]{4})\b""".toRegex()
+fun String.magnet(): Sequence<String> = rmagnet.findAll(this).map { it.value } +
+        rbaidu.findAll(this).map { m -> "${m.groups[1]!!.value},${m.groups[2]!!.value}" }
+
 fun <T> Gson.fromJsonOrNull(json: String?, clazz: Class<T>): T? = try {
-    fromJson<T>(json, clazz)
+    fromJson(json, clazz)
 } catch (_: Exception) {
     null
 }
 
 inline fun <reified T> Gson.fromJsonOrNull(json: String?): T? = fromJsonOrNull(json, T::class.java)
 
+fun String.jsoup(uri: String): Document = Jsoup.parse(this, uri)
+
 fun Pair<String, String>.jsoup(): Document = this.let { h ->
     Jsoup.parse(h.first, h.second)
 }
 
 fun <T> Pair<String, String>.jsoup(f: (Document) -> T?): T? = f(this.jsoup())
-fun version(context: Context): String = try {
-    context.packageManager.getPackageInfo(context.packageName, 0).versionName
+fun Context.version(): Version? = try {
+    Version(packageManager.getPackageInfo(packageName, 0).versionName)
 } catch (e: Exception) {
-    e.printStackTrace(); ""
+    e.printStackTrace(); null
 }
 
-fun versionBefore(local: String, online: String): Boolean = try {
-    val l = local.split("""\.""").map { it.toInt() }.toList()
-    val o = online.split("""\.""").map { it.toInt() }.toList()
-    for (i in 0 until min(l.size, o.size)) {
-        (l[i] - o[i]).let { x ->
-            when {
-                x > 0 -> return false
-                x < 0 -> return true
-                else -> {
-                }
-            }
-        }
-    }
-    if (o.size > l.size) {
-        o.drop(l.size).any { it != 0 }
-    } else false
-} catch (_: Exception) {
-    false
-}
-
-inline fun <reified T : View> View.findViewByViewType(id: Int = 0): Sequence<View> = this.childrenRecursiveSequence()
-        .filter { it is T }.filter { id == 0 || id == it.id }
+inline fun <reified T : View> View.findViewByViewType(id: Int = 0): Sequence<T> =
+        this.childrenRecursiveSequence().mapNotNull { it as? T }.filter { id == 0 || id == it.id }
 
 fun Activity.snack(text: CharSequence, duration: Int = Snackbar.LENGTH_SHORT): Snackbar = this.window.decorView.let { view ->
     view.findViewByViewType<CoordinatorLayout>().firstOrNull()
@@ -385,99 +361,168 @@ fun Bundle.string(key: String, value: String): Bundle = this.also { it.putString
 
 fun Bundle.parcelable(key: String, value: Parcelable): Bundle = this.also { it.putParcelable(key, value) }
 
-fun <A, B> List<A>.pmap(f: (A) -> B): List<B> = map { doAsyncResult { f(it) } }.map { it.get() }
+suspend fun <A, B> Iterable<A>.pmap(f: suspend (A) -> B): List<B> = coroutineScope { map { async { f(it) } }.awaitAll() }
 
 fun TedPermission.Builder.onPermissionGranted(f: () -> Unit): TedPermission.Builder = setPermissionListener(object : PermissionListener {
-    override fun onPermissionGranted() {
-        f()
-    }
-
-    override fun onPermissionDenied(deniedPermissions: ArrayList<String>?) {
-    }
+    override fun onPermissionGranted() = f()
+    override fun onPermissionDenied(deniedPermissions: MutableList<String>?) = Unit
 })
 
-fun TedPermission.Builder.onPermissionDenied(f: (ArrayList<String>?) -> Unit): TedPermission.Builder = setPermissionListener(object : PermissionListener {
-    override fun onPermissionGranted() {
-    }
-
-    override fun onPermissionDenied(deniedPermissions: ArrayList<String>?) {
-        f(deniedPermissions)
-    }
+fun TedPermission.Builder.onPermissionDenied(f: (List<String>?) -> Unit): TedPermission.Builder = setPermissionListener(object : PermissionListener {
+    override fun onPermissionGranted() = Unit
+    override fun onPermissionDenied(deniedPermissions: MutableList<String>?) = f(deniedPermissions)
 })
 
-open class ViewBinder<T, V : View>(private var value: T, private val func: (V, T) -> Unit) {
-    private val view = WeakHashMap<V, Boolean>()
-    open operator fun plus(v: V): ViewBinder<T, V> = synchronized(this) {
-        view[v] = true
-        func(v, value)
-        this
+abstract class DataAdapter<V, VH : RecyclerView.ViewHolder>(private val diffCallback: DiffUtil.ItemCallback<V>) : RecyclerView.Adapter<VH>() {
+    private val differ by lazy {
+        AsyncListDiffer(AdapterListUpdateCallback(this), AsyncDifferConfig.Builder(diffCallback).build())
+    }
+    val data: List<V> get() = differ.currentList
+    override fun getItemCount(): Int = differ.currentList.size
+
+    open fun clear(): DataAdapter<V, VH> = apply {
+        differ.submitList(null)
     }
 
-    operator fun minus(v: V): ViewBinder<T, V> = synchronized(this) {
-        view.remove(v)
-        this
+    open fun add(v: V, index: Int = data.size): DataAdapter<V, VH> = apply {
+        differ.submitList(data.toMutableList().apply { add(index, v) })
     }
 
-    operator fun times(v: T): ViewBinder<T, V> = synchronized(this) {
-        if (value != v) {
-            value = v
-            view.forEach { func(it.key, value) }
+    open fun addAll(v: List<V>): DataAdapter<V, VH> = apply {
+        differ.submitList(data.toMutableList().apply { addAll(v) })
+    }
+
+    open fun remove(v: V): DataAdapter<V, VH> = apply {
+        differ.submitList(data.toMutableList().apply { remove(v) })
+    }
+
+    open fun getItem(position: Int): V? = data[position]
+}
+
+abstract class PagingAdapter<V, VH : RecyclerView.ViewHolder>(diffCallback: DiffUtil.ItemCallback<V>) : DataAdapter<V, VH>(diffCallback) {
+    private val refreshCh = Channel<Boolean>()
+    val refreshFlow = refreshCh.consumeAsFlow()
+    val state = MutableLiveData<LoadState>()
+    fun withLoadStateFooter(footer: LoadStateAdapter<*>): ConcatAdapter {
+        state.observeForever { footer.loadState = it }
+        return ConcatAdapter(this, footer)
+    }
+
+    override fun add(v: V, index: Int): DataAdapter<V, VH> = apply {
+        val fist = itemCount == 0
+        super.add(v, index)
+        if (fist && itemCount != 0) refreshCh.trySend(true)
+    }
+
+    override fun addAll(v: List<V>): DataAdapter<V, VH> = apply {
+        val fist = itemCount == 0
+        super.addAll(v)
+        if (fist && itemCount != 0) refreshCh.trySend(true)
+    }
+}
+
+abstract class LoadStateAdapter<VH : RecyclerView.ViewHolder> : RecyclerView.Adapter<VH>() {
+    private var display: Boolean = false
+        set(value) {
+            if (field != value) {
+                if (value) notifyItemInserted(0) else notifyItemRemoved(0)
+                field = value
+            }
         }
-        this
+    var loadState: LoadState = LoadState.NotLoading(endOfPaginationReached = false)
+        set(value) {
+            if (field != value) field = value
+            val new = displayLoadStateAsItem(value)
+            if (display != new) display = new else {
+                if (field != value) notifyItemChanged(0)
+            }
+        }
+
+    final override fun getItemCount(): Int = if (display) 1 else 0
+    final override fun onCreateViewHolder(parent: ViewGroup, viewType: Int): VH {
+        return onCreateViewHolder(parent, loadState)
     }
 
-    operator fun invoke(): T = value
+    final override fun onBindViewHolder(holder: VH, position: Int) {
+        onBindViewHolder(holder, loadState)
+    }
 
-    fun each(func: (V) -> Unit): ViewBinder<T, V> = synchronized(this) {
-        view.forEach { func(it.key) }
-        this
+    final override fun getItemViewType(position: Int): Int = getStateViewType(loadState)
+    abstract fun onCreateViewHolder(parent: ViewGroup, loadState: LoadState): VH
+    abstract fun onBindViewHolder(holder: VH, loadState: LoadState)
+    open fun getStateViewType(loadState: LoadState): Int = 0
+    open fun displayLoadStateAsItem(loadState: LoadState): Boolean = loadState is LoadState.Loading || loadState is LoadState.Error
+}
+
+fun <T : Any> SavedStateHandle.saveAsJson(it: T, name: String) {
+    set("${name}-Class", it.javaClass.name)
+    set("${name}-Json", gson.toJson(it))
+}
+
+fun <T : Any> SavedStateHandle.loadForJson(name: String, def: () -> T?): T? {
+    val clazz = get<String>("${name}-Class")?.let { Class.forName(it) }
+    val json = get<String>("${name}-Json")
+    @Suppress("UNCHECKED_CAST")
+    return (if (clazz != null && json != null)
+        gson.fromJson(json, clazz) as? T
+    else null) ?: def()
+}
+
+@Parcelize
+open class LoadState : Parcelable {
+    @Parcelize
+    class NotLoading(val endOfPaginationReached: Boolean) : LoadState() {
+        override fun toString(): String = "NotLoading(endOfPaginationReached=$endOfPaginationReached)"
+        override fun equals(other: Any?): Boolean = other is NotLoading && endOfPaginationReached == other.endOfPaginationReached
+        override fun hashCode(): Int = endOfPaginationReached.hashCode()
+
+        internal companion object {
+            internal val Complete = NotLoading(endOfPaginationReached = true)
+            internal val Incomplete = NotLoading(endOfPaginationReached = false)
+        }
+    }
+
+    @Parcelize
+    object Loading : LoadState() {
+        override fun toString(): String = "Loading"
+        override fun equals(other: Any?): Boolean = other is Loading
+    }
+
+    @Parcelize
+    class Error(val error: Throwable) : LoadState() {
+        override fun equals(other: Any?): Boolean = other is Error && error == other.error
+        override fun hashCode(): Int = error.hashCode()
+        override fun toString(): String = "Error(error=$error)"
     }
 }
 
-abstract class ErrorBinder(value: Boolean) : ViewBinder<Boolean, View>(value, { v, t -> v.visibility = if (t) View.VISIBLE else View.INVISIBLE }) {
-    override fun plus(v: View): ViewBinder<Boolean, View> {
-        v.setOnClickListener { retry() }
-        return super.plus(v)
-    }
-
-    abstract fun retry()
-}
-
-abstract class DataAdapter<V, VH : RecyclerView.ViewHolder> : RecyclerView.Adapter<VH>() {
-    private val _data = mutableListOf<V>()
-
-    override fun getItemCount(): Int = size
-
-    val size: Int get() = _data.size
-    val data: List<V> get() = _data
-    fun clear(): DataAdapter<V, VH> {
-        val size = _data.size
-        _data.clear()
-        notifyItemRangeRemoved(0, size)
-        return this
-    }
-
-    fun add(v: V, index: Int = _data.size): DataAdapter<V, VH> {
-        _data.add(index, v)
-        notifyItemInserted(index)
-        return this
-    }
-
-    fun addAll(v: List<V>): DataAdapter<V, VH> {
-        _data.addAll(v)
-        notifyItemRangeInserted(_data.size - v.size, v.size)
-        return this
-    }
-
-    fun remove(v: V): DataAdapter<V, VH> {
-        val index = _data.indexOf(v)
-        if (index == -1) return this
-        _data.removeAt(index)
-        notifyItemRemoved(index)
-        return remove(v)
+class Paging<K : Any, V : Any>(private val handle: SavedStateHandle, private val k: K?, factory: () -> PagingSource<K, V>) {
+    private var key: K?
+        get() = if (handle.contains("key")) handle["key"] else k
+        set(value) = handle.set("key", value)
+    val state = handle.getLiveData<LoadState>("state", LoadState.NotLoading(false))
+    private val source by lazy(factory)
+    private val mutex = Mutex()
+    suspend fun query(refresh: Boolean = false): Pair<List<V>?, Throwable?> {
+        mutex.withLock {
+            if (state.value is LoadState.Loading) return null to null
+            if (refresh) handle.remove<String?>("key")
+            if (key == null) return null to null
+            state.setValue(LoadState.Loading)
+        }
+        return when (val result = source.load(PagingSource.LoadParams.Append(key!!, 20, false))) {
+            is PagingSource.LoadResult.Page -> {
+                key = result.nextKey
+                state.postValue(LoadState.NotLoading(result.nextKey == null))
+                result.data to null
+            }
+            is PagingSource.LoadResult.Error -> {
+                state.postValue(LoadState.Error(result.throwable))
+                null to result.throwable
+            }
+        }
     }
 }
-
 
 class RoundedBackgroundColorSpan(private val backgroundColor: Int) : ReplacementSpan() {
     private val linePadding = 2f // play around with these as needed
@@ -527,6 +572,7 @@ fun <T> List<T>.spannable(separator: CharSequence = " ", string: (T) -> String =
 
 class Once {
     private var init = false
+
     @Synchronized
     fun run(call: () -> Unit) {
         if (init) return
@@ -541,7 +587,7 @@ fun RecyclerView.loading(last: Int = 1, call: () -> Unit) {
             when (val layout = recycler.layoutManager) {
                 is StaggeredGridLayoutManager -> {
                     val vis = layout.findLastVisibleItemPositions(null)
-                    val v = vis.max() ?: 0
+                    val v = vis.maxOrNull() ?: 0
                     if (v >= (this@loading.adapter!!.itemCount - last)) call()
                 }
                 is GridLayoutManager ->
@@ -566,94 +612,37 @@ fun RecyclerView.loading(last: Int = 1, call: () -> Unit) {
     })
 }
 
-data class Quadruple<out A, out B, out C, out D>(
-        val first: A,
-        val second: B,
-        val third: C,
-        val fourth: D
-) : java.io.Serializable {
-
-    /**
-     * Returns string representation of the [Triple] including its [first], [second] and [third] values.
-     */
-    override fun toString(): String = "($first, $second, $third, $fourth)"
-}
-
-/**
- * Converts this triple into a list.
- */
-fun <T> Quadruple<T, T, T, T>.toList(): List<T> = listOf(first, second, third, fourth)
-
-data class Quintuple<out A, out B, out C, out D, out E>(
-        val first: A,
-        val second: B,
-        val third: C,
-        val fourth: D,
-        val fifth: E
-) : java.io.Serializable {
-
-    /**
-     * Returns string representation of the [Triple] including its [first], [second] and [third] values.
-     */
-    override fun toString(): String = "($first, $second, $third, $fourth, $fifth)"
-}
-
-/**
- * Converts this triple into a list.
- */
-fun <T> Quintuple<T, T, T, T, T>.toList(): List<T> = listOf(first, second, third, fourth, fifth)
-
-data class Sextuple<out A, out B, out C, out D, out E, out F>(
-        val first: A,
-        val second: B,
-        val third: C,
-        val fourth: D,
-        val fifth: E,
-        val sixth: F
-) : java.io.Serializable {
-
-    /**
-     * Returns string representation of the [Triple] including its [first], [second] and [third] values.
-     */
-    override fun toString(): String = "($first, $second, $third, $fourth, $fifth, $sixth)"
-}
-
-/**
- * Converts this triple into a list.
- */
-fun <T> Sextuple<T, T, T, T, T, T>.toList(): List<T> = listOf(first, second, third, fourth, fifth, sixth)
-
-
 class PagerSlidingPaneLayout @JvmOverloads constructor(context: Context, attrs: AttributeSet? = null, defStyle: Int = 0) : SlidingPaneLayout(context, attrs, defStyle) {
     private var mInitialMotionX: Float = 0F
     private var mInitialMotionY: Float = 0F
     private val mEdgeSlop: Float = ViewConfiguration.get(context).scaledEdgeSlop.toFloat()
 
-    @SuppressLint("ClickableViewAccessibility")
-    override fun onTouchEvent(ev: MotionEvent?): Boolean = super.onTouchEvent(ev)
-
-    override fun onInterceptTouchEvent(ev: MotionEvent): Boolean {
-        return when (ev.action) {
-            MotionEvent.ACTION_DOWN -> {
-                mInitialMotionX = ev.x
-                mInitialMotionY = ev.y
-                null
-            }
-            MotionEvent.ACTION_MOVE -> {
-                val x = ev.x
-                val y = ev.y
-                if (mInitialMotionX > mEdgeSlop && !isOpen && canScroll(this, false,
-                                (x - mInitialMotionX).roundToInt(), x.roundToInt(), y.roundToInt())) {
+    override fun onInterceptTouchEvent(ev: MotionEvent): Boolean = when (ev.action) {
+        MotionEvent.ACTION_DOWN -> {
+            mInitialMotionX = ev.x
+            mInitialMotionY = ev.y
+            null
+        }
+        MotionEvent.ACTION_MOVE -> {
+            val x = ev.x
+            val y = ev.y
+            val dx = (x - mInitialMotionX).roundToInt()
+            when {
+                mInitialMotionX <= mEdgeSlop -> null
+                isOpen -> null
+                dx == 0 -> null
+                !canScroll(this, false, dx, x.roundToInt(), y.roundToInt()) -> null
+                else -> {
                     val me = MotionEvent.obtain(ev)
                     me.action = MotionEvent.ACTION_CANCEL
                     super.onInterceptTouchEvent(me).also {
                         me.recycle()
                     }
-                } else null
+                }
             }
-            else -> null
-        } ?: super.onInterceptTouchEvent(ev)
-    }
+        }
+        else -> null
+    } ?: super.onInterceptTouchEvent(ev)
 }
 
 @SuppressLint("Registered")
@@ -662,6 +651,30 @@ open class BaseSlideCloseActivity : AppCompatActivity(), SlidingPaneLayout.Panel
     override fun onCreate(state: Bundle?) {
         swipe()
         super.onCreate(state)
+        (window.decorView as? ViewGroup)?.setOnHierarchyChangeListener(object : ViewGroup.OnHierarchyChangeListener, View.OnLayoutChangeListener {
+            override fun onChildViewRemoved(parent: View?, child: View?) {
+                child?.removeOnLayoutChangeListener(this)
+            }
+
+            override fun onChildViewAdded(parent: View?, child: View?) {
+                if (child?.id == android.R.id.navigationBarBackground) {
+                    reset(child.height)
+                    child.addOnLayoutChangeListener(this)
+                }
+            }
+
+            override fun onLayoutChange(v: View?, left: Int, top: Int, right: Int, bottom: Int, oldLeft: Int, oldTop: Int, oldRight: Int, oldBottom: Int) {
+                reset(bottom - top)
+            }
+
+            fun reset(height: Int) {
+                (window.decorView as? ViewGroup)?.children?.firstOrNull { it is PagerSlidingPaneLayout }?.let {
+                    it.layoutParams = (it.layoutParams as? FrameLayout.LayoutParams)?.apply {
+                        bottomMargin = height
+                    }
+                }
+            }
+        })
     }
 
     private fun swipe() {
@@ -684,11 +697,8 @@ open class BaseSlideCloseActivity : AppCompatActivity(), SlidingPaneLayout.Panel
         val leftView = View(this)
         leftView.layoutParams = ViewGroup.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT)
         swipe.addView(leftView, 0)
-        swipe.layoutParams = FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT).apply {
-            bottomMargin = getSoftButtonsBarHeight()
-        }
+        swipe.layoutParams = FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT)
         val decorView = window.decorView as ViewGroup
-
 
         // 右侧的内容视图
         val decorChild = decorView.getChildAt(0) as ViewGroup
@@ -702,32 +712,6 @@ open class BaseSlideCloseActivity : AppCompatActivity(), SlidingPaneLayout.Panel
         swipe.addView(decorChild, 1)
     }
 
-    /**
-     * 判断是否是小米手机 并且是否开启全面屏
-     *
-     * @return
-     */
-    fun isXiaoMi(context: Context): Boolean {
-        return if (Build.MANUFACTURER == "Xiaomi") {
-            return Settings.Global.getInt(context.contentResolver, "force_fsg_nav_bar", 0) != 0
-        } else false
-    }
-
-    private fun getSoftButtonsBarHeight():Int{
-        val metrics = DisplayMetrics()
-        val usableHeight = metrics.heightPixels
-        if (isXiaoMi(this))
-            return 0
-        else if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.JELLY_BEAN_MR1)
-        windowManager.defaultDisplay.getMetrics(metrics) // 获取实际屏幕信息
-        windowManager.defaultDisplay.getRealMetrics(metrics) //获取真正的屏幕高度(适用于有虚拟键)
-        val realHeight = metrics.heightPixels
-        if (realHeight > usableHeight) //真实高度与可用高度的处理
-            return realHeight - usableHeight
-        return 0
-    }
-
-
     override fun onPanelSlide(panel: View, slideOffset: Float) {
 
     }
@@ -740,14 +724,4 @@ open class BaseSlideCloseActivity : AppCompatActivity(), SlidingPaneLayout.Panel
     override fun onPanelClosed(panel: View) {
 
     }
-}
-
-fun <T> AnkoAsyncContext<T>.autoUiThread(f: (T) -> Unit): Boolean {
-    val context = weakRef.get() ?: return false
-    val activity: Activity? = when (context) {
-        is Fragment -> if (context.isDetached) null else context.activity
-        is Activity -> if (context.isFinishing) null else context
-        else -> null
-    }
-    return activity?.runOnUiThread { f(context) }?.let { true } ?: false
 }

@@ -4,40 +4,42 @@ package io.github.yueeng.hacg
 
 import android.Manifest
 import android.annotation.SuppressLint
-import android.annotation.TargetApi
 import android.app.DownloadManager
 import android.app.DownloadManager.Request
-import android.content.*
+import android.content.ClipData
+import android.content.ClipboardManager
+import android.content.Context
+import android.content.Intent
 import android.net.Uri
 import android.os.Build
 import android.os.Bundle
 import android.os.Environment
-import android.view.LayoutInflater
-import android.view.MenuItem
-import android.view.View
-import android.view.ViewGroup
+import android.view.*
 import android.webkit.*
 import android.widget.*
-import androidx.annotation.RequiresApi
 import androidx.appcompat.app.AlertDialog
 import androidx.appcompat.app.AppCompatActivity
 import androidx.core.content.FileProvider
+import androidx.core.os.bundleOf
 import androidx.fragment.app.Fragment
+import androidx.fragment.app.viewModels
+import androidx.lifecycle.*
+import androidx.lifecycle.Observer
+import androidx.paging.PagingSource
+import androidx.paging.PagingState
 import androidx.preference.PreferenceManager
-import androidx.recyclerview.widget.LinearLayoutManager
+import androidx.recyclerview.widget.DiffUtil
 import androidx.recyclerview.widget.RecyclerView
-import androidx.swiperefreshlayout.widget.SwipeRefreshLayout
-import androidx.viewpager.widget.ViewPager
+import androidx.savedstate.SavedStateRegistryOwner
+import androidx.viewpager2.adapter.FragmentStateAdapter
 import androidx.viewpager2.widget.ViewPager2
-import com.github.clans.fab.FloatingActionButton
 import com.github.clans.fab.FloatingActionMenu
+import com.google.android.material.dialog.MaterialAlertDialogBuilder
 import com.gun0912.tedpermission.TedPermission
-import com.squareup.picasso.Picasso
-import org.jetbrains.anko.childrenRecursiveSequence
-import org.jetbrains.anko.doAsync
+import io.github.yueeng.hacg.databinding.*
+import kotlinx.coroutines.flow.collectLatest
 import org.jsoup.Jsoup
 import org.jsoup.safety.Whitelist
-import java.text.SimpleDateFormat
 import java.util.*
 
 /**
@@ -46,16 +48,13 @@ import java.util.*
  */
 
 class InfoActivity : BaseSlideCloseActivity() {
-    private val _article: Article by lazy { intent.getParcelableExtra<Article>("article") }
-
     override fun onCreate(state: Bundle?) {
         super.onCreate(state)
         setContentView(R.layout.activity_info)
-
         val manager = supportFragmentManager
 
         val fragment = manager.findFragmentById(R.id.container)?.takeIf { it is InfoFragment }
-                ?: InfoFragment().arguments(Bundle().parcelable("article", _article))
+                ?: InfoFragment().arguments(intent.extras)
 
         manager.beginTransaction().replace(R.id.container, fragment).commit()
     }
@@ -75,113 +74,105 @@ class InfoActivity : BaseSlideCloseActivity() {
 }
 
 class InfoFragment : Fragment() {
-    private val _article: Article by lazy { arguments!!.getParcelable<Article>("article")!! }
-    private val _adapter by lazy { CommentAdapter() }
-    private val _web = ViewBinder<Pair<String, String>?, WebView>(null) { view, value -> if (value != null) view.loadDataWithBaseURL(value.second, value.first, "text/html", "utf-8", null) }
-    private val _error = object : ErrorBinder(false) {
-        override fun retry(): Unit = query(_article.link)
-    }
-    private val _post = mutableMapOf<String, String>()
-    private var _postParentId: Int? = null
-    private var _postOffset: Int = 1
-    private var _wpdiscuz: Wpdiscuz? = null
-    private val CONFIG_AUTHOR = "config.author"
-    private val CONFIG_EMAIL = "config.email"
-    private val AUTHOR = "wc_name"
-    private val EMAIL = "wc_email"
-    private var COMMENT = "wc_comment"
-    private val COMMENTURL
-        get() = _wpdiscuz?.customAjaxUrl
-                ?: "${HAcg.wordpress}/wp-content/plugins/wpdiscuz/utils/ajax/wpdiscuz-ajax.php"
-
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         setHasOptionsMenu(true)
-        retainInstance = true
-        val preference = PreferenceManager.getDefaultSharedPreferences(activity)
-        _post += (AUTHOR to preference.getString(CONFIG_AUTHOR, "")!!)
-        _post += (EMAIL to preference.getString(CONFIG_EMAIL, "")!!)
-        query(_article.link)
-    }
-
-    private val _magnet = ViewBinder<List<String>, View>(listOf()) { view, value -> view.visibility = if (value.isNotEmpty()) View.VISIBLE else View.GONE }
-
-    private val _progress = ViewBinder<Boolean, ProgressBar>(false) { view, value ->
-        view.isIndeterminate = value
-        view.visibility = if (value) View.VISIBLE else View.INVISIBLE
-    }
-
-    private val _progress2 = ViewBinder<Boolean, SwipeRefreshLayout>(false) { view, value -> view.post { view.isRefreshing = value } }
-
-    override fun onDestroy() {
-        super.onDestroy()
-        _web.each { it.destroy() }
     }
 
     override fun onCreateView(inflater: LayoutInflater, container: ViewGroup?, savedInstanceState: Bundle?): View =
-            inflater.inflate(R.layout.fragment_info, container, false)
+            FragmentInfoBinding.inflate(inflater, container, false).also { binding ->
+                val activity = activity as AppCompatActivity
+                activity.setSupportActionBar(binding.toolbar)
+                activity.supportActionBar?.setDisplayHomeAsUpEnabled(true)
+                binding.container.adapter = InfoAdapter(this)
+            }.root
 
-    override fun onViewCreated(view: View, state: Bundle?) {
-        val activity = activity as AppCompatActivity
-        activity.setSupportActionBar(view.findViewById(R.id.toolbar))
-        activity.supportActionBar?.setLogo(R.mipmap.ic_launcher)
-        activity.supportActionBar?.setDisplayHomeAsUpEnabled(true)
-        activity.title = _article.title
-        view.findViewById<ViewPager2>(R.id.container).adapter = InfoAdapter()
+    inner class InfoAdapter(fm: Fragment) : FragmentStateAdapter(fm) {
+        override fun getItemCount(): Int = 2
+
+        override fun createFragment(position: Int): Fragment {
+            return when (position) {
+                0 -> InfoWebFragment().arguments(arguments)
+                1 -> InfoCommentFragment().arguments(arguments)
+                else -> throw IllegalArgumentException()
+            }
+        }
+
     }
 
-    @SuppressLint("SetJavaScriptEnabled")
-    inner class WebHolder(root: View) : RecyclerView.ViewHolder(root) {
-        init {
-            _error + root.findViewById(R.id.image1)
-            val menu: FloatingActionMenu = root.findViewById(R.id.menu1)
-            menu.menuButtonColorNormal = randomColor()
-            menu.menuButtonColorPressed = randomColor()
-            menu.menuButtonColorRipple = randomColor()
-            val click = View.OnClickListener { v ->
-                when (v.id) {
-                    R.id.button1 -> openWeb(activity!!, _article.link!!)
-                    R.id.button2 -> view?.findViewById<ViewPager2>(R.id.container)?.currentItem = 1
-                    R.id.button4 -> share()
-                }
-                view?.findViewById<FloatingActionMenu>(R.id.menu1)?.close(true)
-            }
-            listOf(R.id.button1, R.id.button2, R.id.button4)
-                    .map { root.findViewById<View>(it) }.forEach {
-                        it.setOnClickListener(click)
+    fun onBackPressed(): Boolean = FragmentInfoBinding.bind(requireView()).container
+            .takeIf { it.currentItem > 0 }?.let { it.currentItem = 0; true } ?: false
+}
+
+class InfoWebViewModel(handle: SavedStateHandle, args: Bundle?) : ViewModel() {
+    val web = handle.getLiveData<Pair<String, String>>("web")
+    val error = handle.getLiveData("error", false)
+    val magnet = handle.getLiveData<List<String>>("magnet", emptyList())
+    val progress = handle.getLiveData("progress", false)
+    val article: MutableLiveData<Article> = handle.getLiveData("article", args?.getParcelable("article"))
+}
+
+class InfoWebViewModelFactory(owner: SavedStateRegistryOwner, private val defaultArgs: Bundle? = null) : AbstractSavedStateViewModelFactory(owner, defaultArgs) {
+    @Suppress("UNCHECKED_CAST")
+    override fun <T : ViewModel?> create(key: String, modelClass: Class<T>, handle: SavedStateHandle): T = InfoWebViewModel(handle, defaultArgs) as T
+}
+
+class InfoWebFragment : Fragment() {
+    private val viewModel: InfoWebViewModel by viewModels { InfoWebViewModelFactory(this, arguments) }
+    private val _url by lazy { viewModel.article.value?.link ?: requireArguments().getString("url")!! }
+
+    override fun onCreateView(inflater: LayoutInflater, container: ViewGroup?, savedInstanceState: Bundle?): View =
+            FragmentInfoWebBinding.inflate(inflater, container, false).also { binding ->
+                viewModel.article.observe(viewLifecycleOwner, Observer { it?.title?.takeIf { i -> i.isNotEmpty() }?.let { t -> requireActivity().title = t } })
+                viewModel.error.observe(viewLifecycleOwner, Observer { binding.image1.visibility = if (it) View.VISIBLE else View.INVISIBLE })
+                binding.image1.setOnClickListener { query(_url) }
+                binding.menu1.setRandomColor()
+                val click = View.OnClickListener { v ->
+                    when (v.id) {
+                        R.id.button1 -> activity?.openUri(_url)
+                        R.id.button2 -> activity?.window?.decorView
+                                ?.findViewByViewType<ViewPager2>(R.id.container)?.firstOrNull()?.currentItem = 1
+                        R.id.button4 -> share()
                     }
-
-            _progress + root.findViewById(R.id.progress)
-            _magnet + root.findViewById<View>(R.id.button5).also {
-
-                it.setOnClickListener(object : View.OnClickListener {
+                    view?.findViewById<FloatingActionMenu>(R.id.menu1)?.close(true)
+                }
+                listOf(binding.button1, binding.button2, binding.button4).forEach { it.setOnClickListener(click) }
+                viewModel.progress.observe(viewLifecycleOwner, Observer {
+                    binding.progress.isIndeterminate = it
+                    binding.progress.visibility = if (it) View.VISIBLE else View.INVISIBLE
+                })
+                viewModel.magnet.observe(viewLifecycleOwner, Observer {
+                    binding.button5.visibility = if (it.isNotEmpty()) View.VISIBLE else View.GONE
+                })
+                binding.button5.setOnClickListener(object : View.OnClickListener {
                     val max = 3
-                    var magnet = 3
+                    var magnet = 1
                     var toast: Toast? = null
 
                     override fun onClick(v: View): Unit = when {
-                        magnet == max && _magnet().isNotEmpty() -> {
-                            AlertDialog.Builder(activity!!)
+                        magnet == max -> {
+                            val magnets = viewModel.magnet.value ?: emptyList()
+                            MaterialAlertDialogBuilder(activity!!)
                                     .setTitle(R.string.app_magnet)
-                                    .setSingleChoiceItems(_magnet().map { m -> "${if (m.contains(",")) "baidu" else "magnet"}:$m" }.toTypedArray(), 0, null)
+                                    .setSingleChoiceItems(magnets.map { m -> "${if (m.contains(",")) "baidu" else "magnet"}:$m" }.toTypedArray(), 0, null)
                                     .setNegativeButton(R.string.app_cancel, null)
                                     .setPositiveButton(R.string.app_open) { d, _ ->
                                         val pos = (d as AlertDialog).listView.checkedItemPosition
-                                        val item = _magnet()[pos]
+                                        val item = magnets[pos]
                                         val link = if (item.contains(",")) {
                                             val baidu = item.split(",")
                                             context?.clipboard(getString(R.string.app_magnet), baidu.last())
                                             "https://yun.baidu.com/s/${baidu.first()}"
-                                        } else "magnet:?xt=urn:btih:${_magnet()[pos]}"
+                                        } else "magnet:?xt=urn:btih:${magnets[pos]}"
                                         startActivity(Intent.createChooser(Intent(Intent.ACTION_VIEW, Uri.parse(link)), getString(R.string.app_magnet)))
                                     }
                                     .setNeutralButton(R.string.app_copy) { d, _ ->
                                         val pos = (d as AlertDialog).listView.checkedItemPosition
-                                        val item = _magnet()[pos]
-                                        val link = if (item.contains(",")) "https://yun.baidu.com/s/${item.split(",").first()}" else "magnet:?xt=urn:btih:${_magnet()[pos]}"
+                                        val item = magnets[pos]
+                                        val link = if (item.contains(",")) "https://yun.baidu.com/s/${item.split(",").first()}" else "magnet:?xt=urn:btih:${magnets[pos]}"
                                         context?.clipboard(getString(R.string.app_magnet), link)
                                     }.create().show()
-                            menu.close(true)
+                            binding.menu1.close(true)
                         }
                         magnet < max -> {
                             magnet += 1
@@ -191,94 +182,71 @@ class InfoFragment : Fragment() {
                         else -> Unit
                     }
                 })
-            }
-            val web: WebView = root.findViewById(R.id.web)
-            val settings = web.settings
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.LOLLIPOP) {
-                settings.mixedContentMode = WebSettings.MIXED_CONTENT_ALWAYS_ALLOW
-            }
-            settings.javaScriptEnabled = true
-            web.webViewClient = object : WebViewClient() {
-                override fun shouldOverrideUrlLoading(view: WebView?, url: String?): Boolean {
-                    val uri = Uri.parse(url)
-                    startActivity(Intent.createChooser(Intent(Intent.ACTION_VIEW, uri).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK), uri.scheme))
-                    return true
+                CookieManager.getInstance().acceptThirdPartyCookies(binding.web)
+                val settings = binding.web.settings
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.LOLLIPOP) {
+                    settings.mixedContentMode = WebSettings.MIXED_CONTENT_ALWAYS_ALLOW
                 }
+                @SuppressLint("SetJavaScriptEnabled")
+                settings.javaScriptEnabled = true
+                binding.web.webViewClient = object : WebViewClient() {
+                    override fun shouldOverrideUrlLoading(view: WebView?, url: String?): Boolean {
+                        activity?.openUri(url)
+                        return true
+                    }
 
-                @RequiresApi(Build.VERSION_CODES.LOLLIPOP)
-                override fun shouldInterceptRequest(view: WebView?, request: WebResourceRequest?): WebResourceResponse? =
-                        when (request?.url?.scheme?.toLowerCase(Locale.getDefault())) {
-                            "http", "https" -> {
-                                val call = okhttp3.Request.Builder().method(request.method, null).url(request.url.toString()).apply {
-                                    request.requestHeaders?.forEach { header(it.key, it.value) }
-                                }.build()
-                                val response = okhttp.newCall(call).execute()
-                                WebResourceResponse(response.header("content-type", "text/html; charset=UTF-8"),
-                                        response.header("content-encoding", "utf-8"),
-                                        response.body?.byteStream())
-                            }
-                            else -> super.shouldInterceptRequest(view, request)
-                        }
-            }
-            web.addJavascriptInterface(JsFace(), "hacg")
-            _web + web
-        }
+                    override fun shouldInterceptRequest(view: WebView?, request: WebResourceRequest?): WebResourceResponse? =
+                            when (request?.url?.scheme?.lowercase(Locale.getDefault())) {
+                                "http", "https" -> try {
+                                    val call = okhttp3.Request.Builder().method(request.method, null).url(request.url.toString()).apply {
+                                        request.requestHeaders?.forEach { header(it.key, it.value) }
+                                    }.build()
+                                    val response = okhttp.newCall(call).execute()
+                                    WebResourceResponse(response.header("Content-Type", "text/html; charset=UTF-8"),
+                                            response.header("Content-Encoding", "utf-8"),
+                                            response.code,
+                                            response.message,
+                                            response.headers.toMap(),
+                                            response.body?.byteStream())
+                                } catch (_: Exception) {
+                                    null
+                                }
+                                else -> null
+                            } ?: super.shouldInterceptRequest(view, request)
+
+                    override fun onRenderProcessGone(view: WebView?, detail: RenderProcessGoneDetail?): Boolean {
+                        binding.scroll.removeView(binding.web)
+                        binding.web.destroy()
+                        return true
+                    }
+                }
+                binding.web.addJavascriptInterface(JsFace(), "hacg")
+                listOf(binding.button1, binding.button2, binding.button4, binding.button5).forEach { b ->
+                    b.setRandomColor()
+                }
+                viewModel.web.observe(viewLifecycleOwner, Observer { value ->
+                    if (value != null) binding.web.loadDataWithBaseURL(value.second, value.first, "text/html", "utf-8", null)
+                })
+            }.root
+
+    override fun onCreate(savedInstanceState: Bundle?) {
+        super.onCreate(savedInstanceState)
+        if (viewModel.web.value == null) query(_url)
     }
 
-    inner class CommentsHolder(root: View) : RecyclerView.ViewHolder(root) {
-        init {
-            val list: RecyclerView = root.findViewById(R.id.list1)
-            list.layoutManager = LinearLayoutManager(activity)
-            list.setHasFixedSize(true)
-            list.adapter = _adapter
-            list.loading { comment() }
-
-            _progress2 + root.findViewById(R.id.swipe)
-            _progress2.each {
-                it.setOnRefreshListener {
-                    _postOffset = 0
-                    _postParentId = 0
-                    _adapter.clear()
-                    comment()
-                }
-            }
-            root.findViewById<View>(R.id.button3).setOnClickListener { comment(null) }
-        }
+    override fun onDestroyView() {
+        super.onDestroyView()
+        view?.findViewById<WebView>(R.id.web)?.destroy()
     }
 
-    inner class InfoAdapter : RecyclerView.Adapter<RecyclerView.ViewHolder>() {
-
-        override fun getItemViewType(position: Int): Int = position
-
-        override fun onCreateViewHolder(parent: ViewGroup, viewType: Int): RecyclerView.ViewHolder =
-                when (viewType) {
-                    0 -> WebHolder(parent.inflate(R.layout.fragment_info_web))
-                    1 -> CommentsHolder(parent.inflate(R.layout.fragment_info_list))
-                    else -> throw IllegalArgumentException()
-                }.apply {
-                    listOf(R.id.button1, R.id.button2, R.id.button3, R.id.button4, R.id.button5)
-                            .map { itemView.findViewById<View>(it) }.mapNotNull { it as? FloatingActionButton }.forEach { b ->
-                                b.colorNormal = randomColor()
-                                b.colorPressed = randomColor()
-                                b.colorRipple = randomColor()
-                            }
-                }
-
-        override fun getItemCount(): Int = 2
-
-        override fun onBindViewHolder(holder: RecyclerView.ViewHolder, position: Int) {
-        }
-    }
-
-    @TargetApi(Build.VERSION_CODES.JELLY_BEAN_MR1)
     fun share(url: String? = null) {
         fun share(uri: Uri? = null) {
-            val ext = MimeTypeMap.getFileExtensionFromUrl(uri?.toString() ?: _article.link)
+            val ext = MimeTypeMap.getFileExtensionFromUrl(uri?.toString() ?: _url)
             val mime = MimeTypeMap.getSingleton().getMimeTypeFromExtension(ext)?.takeIf { it.isNotEmpty() }
                     ?: "text/plain"
-            val title = _article.title
-            val intro = _article.content
-            val link = _article.link
+            val title = viewModel.article.value?.title ?: ""
+            val intro = viewModel.article.value?.content ?: ""
+            val link = _url
             val share = Intent(Intent.ACTION_SEND)
                     .setType(mime)
                     .putExtra(Intent.EXTRA_TITLE, title)
@@ -288,11 +256,11 @@ class InfoFragment : Fragment() {
             uri?.let { share.putExtra(Intent.EXTRA_STREAM, uri) }
             startActivity(Intent.createChooser(share, title))
         }
-        url?.httpDownloadAsync(context!!) {
-            it?.let { file ->
-                share(FileProvider.getUriForFile(activity!!, "${BuildConfig.APPLICATION_ID}.fileprovider", file))
+        lifecycleScope.launchWhenCreated {
+            url?.httpDownloadAwait()?.let { file ->
+                share(FileProvider.getUriForFile(requireActivity(), "${BuildConfig.APPLICATION_ID}.fileprovider", file))
             } ?: share()
-        } ?: share()
+        }
     }
 
     @Suppress("unused")
@@ -309,8 +277,8 @@ class InfoFragment : Fragment() {
                 val uri = Uri.parse(url)
                 val image = ImageView(activity)
                 image.adjustViewBounds = true
-                Picasso.with(activity).load(uri).placeholder(R.drawable.loading).into(image)
-                val alert = AlertDialog.Builder(activity!!)
+                GlideApp.with(requireActivity()).load(uri).placeholder(R.drawable.loading).into(image)
+                val alert = MaterialAlertDialogBuilder(activity!!)
                         .setView(image)
                         .setNeutralButton(R.string.app_share) { _, _ -> share(url) }
                         .setPositiveButton(R.string.app_save) { _, _ ->
@@ -342,287 +310,355 @@ class InfoFragment : Fragment() {
         }
     }
 
-    fun onBackPressed(): Boolean =
-            view?.findViewById<View>(R.id.container /*drawer*/)?.let { it as? ViewPager }?.takeIf { it.currentItem > 0 }
-                    ?.let { it.currentItem = 0; true } ?: false
+    private fun query(url: String) {
+        if (viewModel.progress.value == true) return
+        viewModel.error.postValue(false)
+        viewModel.progress.postValue(true)
+        lifecycleScope.launchWhenCreated {
+            val dom = url.httpGetAwait()?.jsoup()
+            val article = dom?.select("article")?.firstOrNull()?.let { Article(it) }
+            val entry = dom?.select(".entry-content")?.let { entry ->
+                val clean = Jsoup.clean(entry.html(), url, Whitelist.basicWithImages()
+                        .addTags("audio", "video", "source")
+                        .addAttributes("audio", "controls", "src")
+                        .addAttributes("video", "controls", "src")
+                        .addAttributes("source", "type", "src", "media"))
 
-    fun comment() {
-        if (_progress2() || _postParentId == null) {
-            return
-        }
-        _progress2 * true
-        doAsync {
-            val json = COMMENTURL.httpPost(mapOf("action" to "wpdLoadMoreComments",
-                    "offset" to "$_postOffset",
-                    "orderBy" to "by_vote",
-                    "order" to "desc",
-                    "lastParentId" to "$_postParentId",
-                    "postId" to "${_article.id}"))
-            val comments = gson.fromJsonOrNull<JComment>(json?.first)
-            val list = Jsoup.parse(comments?.comment_list ?: "", json?.second ?: "")
-                    .select(".wc-comment").map { Comment(it) }.toList()
-            autoUiThread {
-                if (comments != null) {
-                    if (comments.is_show_load_more) {
-                        _postParentId = comments.last_parent_id.toIntOrNull()
-                        _postOffset++
-                    } else {
-                        _postParentId = null
-                        _postOffset = 0
+                Jsoup.parse(clean, url).select("body").also { e ->
+                    e.select("[width],[height]").forEach { it.removeAttr("width").removeAttr("height") }
+                    e.select("img[src]").forEach {
+                        it.attr("data-original", it.attr("src"))
+                                .addClass("lazy")
+                                .removeAttr("src")
+                                .after("""<a href="javascript:hacg.save('${it.attr("data-original")}');">下载此图</a>""")
                     }
                 }
-                _adapter.data.lastOrNull()?.let { it as String }?.let {
-                    _adapter.remove(it)
+            }
+            val html = entry?.let {
+                activity?.resources?.openRawResource(R.raw.template)?.bufferedReader()?.readText()
+                        ?.replace("{{title}}", article?.title ?: "")
+                        ?.replace("{{body}}", entry.html())
+            }
+            val magnet = entry?.text()?.magnet()?.toList() ?: emptyList()
+            if (article != null) viewModel.article.postValue(article)
+            when (html) {
+                null -> {
+                    viewModel.error.postValue(viewModel.web.value == null)
                 }
-                _adapter.addAll(list)
-                val (d, u) = (_adapter.size == 0) to (_postParentId == null)
-                _adapter.add(when {
-                    d && u -> getString(R.string.app_list_empty)
-                    u -> getString(R.string.app_list_complete)
-                    else -> getString(R.string.app_list_loading)
+                else -> {
+                    viewModel.magnet.postValue(magnet)
+                    viewModel.web.postValue(html to url)
+                }
+            }
+            viewModel.progress.postValue(false)
+        }
+    }
+}
+
+class InfoCommentPagingSource(private val _id: Int, private val sorting: () -> InfoCommentViewModel.Sorting) : PagingSource<Pair<Int?, Int>, Comment>() {
+    override suspend fun load(params: LoadParams<Pair<Int?, Int>>): LoadResult<Pair<Int?, Int>, Comment> = try {
+        val (_postParentId, _postOffset) = params.key!!
+        val data = mapOf(
+                "action" to "wpdLoadMoreComments",
+                "sorting" to sorting().sort,
+                "offset" to "$_postOffset",
+                "lastParentId" to "$_postParentId",
+                "isFirstLoad" to (if (_postOffset == 0) "1" else "0"),
+                "wpdType" to "",
+                "postId" to "$_id")
+        val json = HAcg.wpdiscuz.httpPostAwait(data)
+        val comments = gson.fromJsonOrNull<JWpdiscuzComment>(json?.first)
+        val list = Jsoup.parse(comments!!.data.commentList ?: "", HAcg.wpdiscuz)
+                .select("body>.wpd-comment").map { Comment(it) }.toList()
+        val next = if (comments.data.isShowLoadMore) {
+            comments.data.lastParentId.toIntOrNull() to (_postOffset + 1)
+        } else {
+            null
+        }
+        LoadResult.Page(list, null, next)
+    } catch (e: Exception) {
+        LoadResult.Error(e)
+    }
+
+    override fun getRefreshKey(state: PagingState<Pair<Int?, Int>, Comment>): Pair<Int?, Int>? = null
+}
+
+class InfoCommentViewModel(id: Int, handle: SavedStateHandle) : ViewModel() {
+    enum class Sorting(val sort: String) {
+        Vote("by_vote"), Newest("newest"), Oldest("oldest")
+    }
+
+    val progress = handle.getLiveData("progress", false)
+    val sorting = handle.getLiveData("sorting", Sorting.Vote)
+    val source = Paging(handle, 0 to 0) { InfoCommentPagingSource(id) { sorting.value!! } }
+    val data = handle.getLiveData<List<Comment>>("data")
+}
+
+class InfoCommentViewModelFactory(owner: SavedStateRegistryOwner, private val args: Bundle? = null) : AbstractSavedStateViewModelFactory(owner, args) {
+    @Suppress("UNCHECKED_CAST")
+    override fun <T : ViewModel?> create(key: String, modelClass: Class<T>, handle: SavedStateHandle): T = InfoCommentViewModel(args?.getInt("id") ?: 0, handle) as T
+}
+
+class InfoCommentFragment : Fragment() {
+    private val viewModel: InfoCommentViewModel by viewModels { InfoCommentViewModelFactory(this, bundleOf("id" to _id)) }
+    private val _article by lazy { requireArguments().getParcelable<Article>("article") }
+    private val _url by lazy { _article?.link ?: requireArguments().getString("url")!! }
+    private val _id by lazy { _article?.id ?: Article.getIdFromUrl(_url) ?: 0 }
+    private val _adapter by lazy { CommentAdapter() }
+    private val adapterPool = RecyclerView.RecycledViewPool()
+    private val CONFIG_AUTHOR = "config.author"
+    private val CONFIG_EMAIL = "config.email"
+    private val CONFIG_COMMENT = "config.comment"
+    private val AUTHOR = "wc_name"
+    private val EMAIL = "wc_email"
+    private var COMMENT = "wc_comment"
+
+    private fun query(refresh: Boolean = false) {
+        lifecycleScope.launchWhenCreated {
+            if (refresh) _adapter.clear()
+            val (list, _) = viewModel.source.query(refresh)
+            if (list != null) _adapter.addAll(list)
+        }
+    }
+
+    override fun onCreateView(inflater: LayoutInflater, container: ViewGroup?, savedInstanceState: Bundle?): View =
+            FragmentInfoListBinding.inflate(inflater, container, false).also { binding ->
+                binding.list1.adapter = _adapter.withLoadStateFooter(FooterAdapter({ _adapter.itemCount }) { query() })
+                viewModel.progress.observe(viewLifecycleOwner, Observer { binding.swipe.isRefreshing = it })
+                viewModel.source.state.observe(viewLifecycleOwner, Observer {
+                    _adapter.state.postValue(it)
+                    binding.swipe.isRefreshing = it is LoadState.Loading
                 })
-                _progress2 * false
+                lifecycleScope.launchWhenCreated {
+                    _adapter.refreshFlow.collectLatest {
+                        binding.list1.scrollToPosition(0)
+                    }
+                }
+                binding.list1.loading {
+                    when (viewModel.source.state.value) {
+                        LoadState.NotLoading(false) -> query()
+                    }
+                }
+                binding.swipe.setOnRefreshListener { query(true) }
+                binding.button3.setRandomColor().setOnClickListener {
+                    comment(null) {
+                        _adapter.add(it, 0)
+                        binding.list1.smoothScrollToPosition(0)
+                    }
+                }
+            }.root
+
+    override fun onCreate(savedInstanceState: Bundle?) {
+        super.onCreate(savedInstanceState)
+        setHasOptionsMenu(true)
+        viewModel.data.value?.let { _adapter.addAll(it) }
+        if (_adapter.itemCount == 0) query()
+    }
+
+    override fun onSaveInstanceState(outState: Bundle) {
+        super.onSaveInstanceState(outState)
+        viewModel.data.value = _adapter.data
+    }
+
+    override fun onCreateOptionsMenu(menu: Menu, inflater: MenuInflater) {
+        inflater.inflate(R.menu.menu_comment, menu)
+        super.onCreateOptionsMenu(menu, inflater)
+    }
+
+    override fun onPrepareOptionsMenu(menu: Menu) {
+        super.onPrepareOptionsMenu(menu)
+        when (viewModel.sorting.value) {
+            InfoCommentViewModel.Sorting.Newest -> menu.findItem(R.id.newest).isChecked = true
+            InfoCommentViewModel.Sorting.Oldest -> menu.findItem(R.id.oldest).isChecked = true
+            else -> menu.findItem(R.id.vote).isChecked = true
+        }
+    }
+
+    override fun onOptionsItemSelected(item: MenuItem): Boolean = when (item.itemId) {
+        R.id.vote, R.id.newest, R.id.oldest -> {
+            viewModel.sorting.postValue(when (item.itemId) {
+                R.id.oldest -> InfoCommentViewModel.Sorting.Oldest
+                R.id.newest -> InfoCommentViewModel.Sorting.Newest
+                else -> InfoCommentViewModel.Sorting.Vote
+            })
+            query(true)
+            true
+        }
+        else -> super.onOptionsItemSelected(item)
+    }
+
+    inner class CommentHolder(private val binding: CommentItemBinding) : RecyclerView.ViewHolder(binding.root) {
+        private val adapter = CommentAdapter()
+        private var comment: Comment? = null
+
+        init {
+            binding.list1.setRecycledViewPool(adapterPool)
+            binding.list1.adapter = adapter
+            listOf(binding.button1, binding.button2).forEach { b ->
+                b.setOnClickListener { view ->
+                    val v = if (view.id == R.id.button1) -1 else 1
+                    val item = comment ?: return@setOnClickListener
+                    val pos = bindingAdapterPosition
+                    vote(item, v) {
+                        item.moderation = it
+                        bindingAdapter?.notifyItemChanged(pos, "moderation")
+                    }
+                }
+            }
+            binding.root.setOnClickListener {
+                comment(comment!!) {
+                    adapter.add(it)
+                }
+            }
+        }
+
+        fun bind(item: Comment, payloads: MutableList<Any>) {
+            if (payloads.contains("moderation")) {
+                binding.text4.text = "${item.moderation}"
+                return
+            }
+            comment = item
+            itemView.tag = item
+            binding.text1.text = item.user
+            binding.text2.text = item.content
+            binding.text3.text = item.time
+            binding.text4.text = "${item.moderation}"
+            adapter.clear()
+            adapter.addAll(item.children)
+            if (item.face.isEmpty()) {
+                binding.image1.setImageResource(R.mipmap.ic_launcher)
+            } else {
+                GlideApp.with(requireContext()).load(item.face).placeholder(R.mipmap.ic_launcher).into(binding.image1)
             }
         }
     }
 
-    fun comment(c: Comment?, pos: Int? = null) {
+    class CommentDiffCallback : DiffUtil.ItemCallback<Comment>() {
+        override fun areItemsTheSame(oldItem: Comment, newItem: Comment): Boolean = oldItem.id == newItem.id
+        override fun areContentsTheSame(oldItem: Comment, newItem: Comment): Boolean = oldItem == newItem
+    }
+
+    inner class CommentAdapter : PagingAdapter<Comment, CommentHolder>(CommentDiffCallback()) {
+        override fun onBindViewHolder(holder: CommentHolder, position: Int) {}
+
+        override fun onBindViewHolder(holder: CommentHolder, position: Int, payloads: MutableList<Any>) {
+            holder.bind(getItem(position)!!, payloads)
+        }
+
+        override fun onCreateViewHolder(parent: ViewGroup, viewType: Int): CommentHolder =
+                CommentHolder(CommentItemBinding.inflate(layoutInflater, parent, false))
+    }
+
+    fun vote(c: Comment?, v: Int, call: (Int) -> Unit) {
+        if (c == null) return
+        lifecycleScope.launchWhenCreated {
+            val result = HAcg.wpdiscuz.httpPostAwait(mapOf(
+                    "action" to "wpdVoteOnComment",
+                    "commentId" to "${c.id}",
+                    "voteType" to "$v",
+                    "postId" to "$_id"))
+            val succeed = gson.fromJsonOrNull<JWpdiscuzVoteSucceed>(result?.first ?: "")
+            if (succeed?.success != true) {
+                val json = gson.fromJsonOrNull<JWpdiscuzVote>(result?.first ?: "")
+                Toast.makeText(requireActivity(), json?.data ?: result?.first, Toast.LENGTH_LONG).show()
+                return@launchWhenCreated
+            }
+            call(succeed.data.votes.toIntOrNull() ?: 0)
+        }
+    }
+
+    fun comment(c: Comment?, succeed: (Comment) -> Unit) {
         if (c == null) {
-            commenting(c, pos)
+            commenting(c, succeed)
             return
         }
-        val alert = AlertDialog.Builder(activity!!)
+        MaterialAlertDialogBuilder(requireActivity())
                 .setTitle(c.user)
                 .setMessage(c.content)
-                .setPositiveButton(R.string.comment_review) { _, _ -> commenting(c, pos) }
+                .setPositiveButton(R.string.comment_review) { _, _ -> commenting(c, succeed) }
                 .setNegativeButton(R.string.app_cancel, null)
                 .setNeutralButton(R.string.app_copy) { _, _ ->
-                    val clipboard = activity!!.getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
+                    val clipboard = requireActivity().getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
                     val clip = ClipData.newPlainText(c.user, c.content)
                     clipboard.setPrimaryClip(clip)
-                    Toast.makeText(activity, activity!!.getString(R.string.app_copied, c.content), Toast.LENGTH_SHORT).show()
-                }
-                .create()
-        alert.setOnShowListener(object : DialogInterface.OnShowListener {
-            fun r(v: Sequence<View>) {
-                if (v.any()) {
-                    rr(v.first())
-                    r(v.drop(1))
-                }
-            }
-
-            fun rr(v: View?): Unit = when (v) {
-                is Button -> {
-                }
-                is TextView ->
-                    v.setTextIsSelectable(true)
-                is ViewGroup ->
-                    r(v.childrenRecursiveSequence())
-                else -> {
-                }
-            }
-
-            override fun onShow(dialog: DialogInterface?) {
-                rr((dialog as? AlertDialog)?.window?.decorView)
-            }
-        })
-        alert.show()
+                    Toast.makeText(activity, requireActivity().getString(R.string.app_copied, c.content), Toast.LENGTH_SHORT).show()
+                }.create().apply {
+                    setOnShowListener { dialog ->
+                        dialog.let { it as? AlertDialog }?.window?.decorView?.childrenRecursiveSequence()
+                                ?.mapNotNull { it as? TextView }?.filter { it !is Button }
+                                ?.forEach { it.setTextIsSelectable(true) }
+                    }
+                }.show()
     }
 
     @SuppressLint("InflateParams")
-    private fun commenting(c: Comment?, pos: Int? = null) {
-        val url = COMMENTURL
-        val input = LayoutInflater.from(activity!!).inflate(R.layout.comment_post, null)
-        val author: EditText = input.findViewById(R.id.edit1)
-        val email: EditText = input.findViewById(R.id.edit2)
-        val content: EditText = input.findViewById(R.id.edit3)
-        author.setText(_post[AUTHOR])
-        email.setText(_post[EMAIL])
-        content.setText(_post[COMMENT] ?: "")
-        _post["wpdiscuz_unique_id"] = (c?.id ?: "0_0")
-        _post["wc_comment_depth"] = "${(c?.depth ?: 1)}"
+    private fun commenting(c: Comment?, succeed: (Comment) -> Unit) {
+        val input = CommentPostBinding.inflate(layoutInflater)
+        val author: EditText = input.edit1
+        val email: EditText = input.edit2
+        val content: EditText = input.edit3
+        val post = mutableMapOf<String, String>()
+        val preference = PreferenceManager.getDefaultSharedPreferences(activity)
+        if (user != 0) {
+            input.input1.visibility = View.GONE
+            input.input2.visibility = View.GONE
+        } else {
+            post += (AUTHOR to preference.getString(CONFIG_AUTHOR, "")!!)
+            post += (EMAIL to preference.getString(CONFIG_EMAIL, "")!!)
+            author.setText(post[AUTHOR])
+            email.setText(post[EMAIL])
+        }
+        post += (COMMENT to preference.getString(CONFIG_COMMENT, "")!!)
+        content.setText(post[COMMENT] ?: "")
+        post["action"] = "wpdAddComment"
+        post["submit"] = "发表评论"
+        post["postId"] = "$_id"
+        post["wpdiscuz_unique_id"] = (c?.uniqueId ?: "0_0")
+        post["wc_comment_depth"] = "${(c?.depth ?: 1)}"
 
         fun fill() {
-            _post[AUTHOR] = author.text.toString()
-            _post[EMAIL] = email.text.toString()
-            _post[COMMENT] = content.text.toString()
-            val preference = PreferenceManager.getDefaultSharedPreferences(activity!!)
-            preference.edit().putString(CONFIG_AUTHOR, _post[AUTHOR]).putString(CONFIG_EMAIL, _post[EMAIL]).apply()
+            post[AUTHOR] = author.text.toString()
+            post[EMAIL] = email.text.toString()
+            post[COMMENT] = content.text.toString()
+            preference.edit().putString(CONFIG_AUTHOR, post[AUTHOR])
+                    .putString(CONFIG_EMAIL, post[EMAIL])
+                    .putString(CONFIG_COMMENT, post[COMMENT]).apply()
         }
 
-        AlertDialog.Builder(activity!!)
+        MaterialAlertDialogBuilder(requireActivity())
                 .setTitle(if (c != null) getString(R.string.comment_review_to, c.user) else getString(R.string.comment_title))
-                .setView(input)
+                .setView(input.root)
                 .setPositiveButton(R.string.comment_submit) { _, _ ->
                     fill()
-                    if (url.isEmpty() || listOf(AUTHOR, EMAIL, COMMENT).map { _post[it] }.any { it.isNullOrEmpty() }) {
-                        Toast.makeText(activity!!, getString(R.string.comment_verify), Toast.LENGTH_SHORT).show()
+                    if (post[COMMENT].isNullOrBlank() || (user == 0 && (post[AUTHOR].isNullOrBlank() || post[EMAIL].isNullOrBlank()))) {
+                        Toast.makeText(requireActivity(), getString(R.string.comment_verify), Toast.LENGTH_SHORT).show()
                         return@setPositiveButton
                     }
-                    _progress2 * true
-                    doAsync {
-                        val result = url.httpPost(_post.toMap())
-                        val review = Jsoup.parse(gson.fromJsonOrNull<JCommentResult>(result?.first)?.message ?: "", result?.second ?: "")
-                                .select(".wc-comment").map { Comment(it) }.firstOrNull()
-                        autoUiThread {
-                            _progress2 * false
-                            if (review == null) {
-                                Toast.makeText(activity!!, result?.first, Toast.LENGTH_LONG).show()
-                                return@autoUiThread
-                            }
-                            _post[COMMENT] = ""
-                            if (c != null) {
-                                c.children.add(review)
-                                _adapter.notifyItemChanged(pos!!)
-                            } else {
-                                _adapter.add(review, 0)
-                            }
+                    viewModel.progress.postValue(true)
+                    lifecycleScope.launchWhenCreated {
+//                        delay(100)
+//                        succeed(Comment(random.nextInt(), c?.id ?: 0, "Test", "ZS", "", 0, datefmt.format(Date()), mutableListOf()))
+                        val result = HAcg.wpdiscuz.httpPostAwait(post.toMap())
+                        val json = gson.fromJsonOrNull<JWpdiscuzCommentResult>(result?.first)
+                        val review = Jsoup.parse(json?.data?.message ?: "", result?.second ?: "")
+                                .select("body>.wpd-comment").map { Comment(it) }.firstOrNull()
+                        if (review == null) {
+                            Toast.makeText(requireActivity(), json?.data?.code ?: result?.first, Toast.LENGTH_LONG).show()
+                        } else {
+                            post[COMMENT] = ""
+                            succeed(review)
                         }
+                        viewModel.progress.postValue(false)
                     }
                 }
                 .setNegativeButton(R.string.app_cancel, null)
+                .apply {
+                    if (user != 0) return@apply
+                    setNeutralButton(R.string.app_user_login) { _, _ ->
+                        startActivity(Intent(requireActivity(), WebActivity::class.java).putExtra("login", true))
+                    }
+                }
                 .setOnDismissListener { fill() }
                 .create().show()
-    }
-
-    fun query(url: String?) {
-        if (_progress() || _progress2() || url.isNullOrEmpty()) {
-            return
-        }
-        _error * false
-        _progress * true
-        _progress2 * true
-        doAsync {
-            val data = url.httpGet()?.jsoup { dom ->
-                val entry = dom.select(".entry-content").let { entry ->
-                    val clean = Jsoup.clean(entry.html(), url, Whitelist.basicWithImages()
-                            .addTags("audio", "video", "source")
-                            .addAttributes("audio", "controls", "src")
-                            .addAttributes("video", "controls", "src")
-                            .addAttributes("source", "type", "src", "media"))
-
-                    Jsoup.parse(clean, url).select("body").also { e ->
-                        e.select("[width],[height]").forEach { it.removeAttr("width").removeAttr("height") }
-                        e.select("img[src]").forEach {
-                            it.attr("data-original", it.attr("src"))
-                                    .addClass("lazy")
-                                    .removeAttr("src")
-                                    .after("""<a href="javascript:hacg.save('${it.attr("data-original")}');">下载此图</a>""")
-                        }
-                    }
-                }
-
-                Quintuple(
-                        HAcgApplication.instance.assets.open("template.html").use {
-                            it.reader().use { r ->
-                                r.readText().replace("{{title}}", _article.title).replace("{{body}}", entry.html())
-                            }
-                        },
-                        dom.select("#comments .wc-thread-wrapper>.wc-comment").map { e -> Comment(e) }.toList(),
-                        dom.select("#comments .wc-load-more-link").firstOrNull()?.attr("data-lastparentid"),
-                        entry.text(),
-                        try {
-                            dom.select("script:containsData(ahk)").firstOrNull()?.data()
-                                    ?.let { it.substring(it.indexOf('{'), it.lastIndexOf('}') + 1) }
-                                    ?.let { gson.fromJson(it, Wpdiscuz::class.java) }
-                        } catch (_: Exception) {
-                            null
-                        }
-                )
-            }
-            autoUiThread {
-                when (data) {
-                    null -> {
-                        _error * (_web() == null)
-                    }
-                    else -> {
-                        _magnet *
-                                ("""\b([a-zA-Z0-9]{32}|[a-zA-Z0-9]{40})\b""".toRegex().findAll(data.fourth!!).map { it.value }.toList() +
-                                        """\b([a-zA-Z0-9]{8})\b\s+\b([a-zA-Z0-9]{4})\b""".toRegex().findAll(data.fourth).map { m -> "${m.groups[1]!!.value},${m.groups[2]!!.value}" })
-                        _web * (data.first to url)
-                        _postParentId = data.third?.toIntOrNull()
-                        _postOffset = 1
-                        _adapter.addAll(data.second)
-                        val (d, u) = (_adapter.size == 0) to (_postParentId == null)
-                        _adapter.add(when {
-                            d && u -> getString(R.string.app_list_empty)
-                            u -> getString(R.string.app_list_complete)
-                            else -> getString(R.string.app_list_loading)
-                        })
-                        _wpdiscuz = data.fifth
-                        _post["action"] = "wpdAddComment"
-                        _post["ahk"] = _wpdiscuz?.wpdiscuz_options?.ahk ?: ""
-                        _post["submit"] = "发表评论"
-                        _post["postId"] = "${_article.id}"
-                    }
-                }
-                _progress * false
-                _progress2 * false
-            }
-        }
-    }
-
-    val datafmt = SimpleDateFormat("yyyy-MM-dd hh:ss", Locale.getDefault())
-
-    inner class CommentHolder(view: View) : RecyclerView.ViewHolder(view) {
-        val text1: TextView = view.findViewById(R.id.text1)
-        val text2: TextView = view.findViewById(R.id.text2)
-        val text3: TextView = view.findViewById(R.id.text3)
-        val text4: TextView = view.findViewById(R.id.text4)
-        val image: ImageView = view.findViewById(R.id.image1)
-        private val list: RecyclerView = view.findViewById(R.id.list1)
-        val adapter = CommentAdapter()
-        val context: Context = view.context
-
-        init {
-            list.adapter = adapter
-            list.layoutManager = LinearLayoutManager(context)
-            list.setHasFixedSize(true)
-            view.setOnClickListener { v ->
-                v.tag?.let { it as Comment }?.let { comment(it, adapterPosition) }
-            }
-        }
-    }
-
-    inner class MsgHolder(view: View) : RecyclerView.ViewHolder(view) {
-        val text1: TextView = view.findViewById(R.id.text1)
-    }
-
-    inner class CommentAdapter : DataAdapter<Any, RecyclerView.ViewHolder>() {
-
-        override fun onBindViewHolder(holder: RecyclerView.ViewHolder, position: Int) {
-            if (holder is CommentHolder) {
-                val item = data[position] as Comment
-                holder.itemView.tag = item
-                holder.text1.text = item.user
-                holder.text2.text = item.content
-                holder.text3.text = item.time?.let { datafmt.format(it) }
-                holder.text3.visibility = if (item.time == null) View.GONE else View.VISIBLE
-                holder.text4.text = item.moderation
-                holder.text4.visibility = if (item.moderation.isEmpty()) View.GONE else View.VISIBLE
-                holder.adapter.clear()
-                holder.adapter.addAll(item.children)
-
-                if (item.face.isEmpty()) {
-                    holder.image.setImageResource(R.mipmap.ic_launcher)
-                } else {
-                    Picasso.with(holder.context).load(item.face).placeholder(R.mipmap.ic_launcher).into(holder.image)
-                }
-            }
-            if (holder is MsgHolder)
-                holder.text1.text = data[position] as String
-        }
-
-        private val CommentTypeComment = 0
-        private val CommentTypeMsg = 1
-        override fun getItemViewType(position: Int): Int = when (data[position]) {
-            is Comment -> CommentTypeComment
-            else -> CommentTypeMsg
-        }
-
-        override fun onCreateViewHolder(parent: ViewGroup, viewType: Int): RecyclerView.ViewHolder = when (viewType) {
-            CommentTypeComment -> CommentHolder(parent.inflate(R.layout.comment_item))
-            else -> MsgHolder(parent.inflate(R.layout.list_msg_item))
-        }
     }
 }

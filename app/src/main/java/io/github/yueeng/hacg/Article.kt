@@ -2,65 +2,70 @@
 
 package io.github.yueeng.hacg
 
-import android.annotation.SuppressLint
 import android.app.Activity
 import android.content.ContentResolver
 import android.content.Context
+import android.net.Uri
 import android.os.Parcelable
-import android.text.InputType
 import android.view.LayoutInflater
-import android.widget.EditText
 import androidx.appcompat.app.AlertDialog
 import androidx.preference.PreferenceManager
+import com.google.android.material.dialog.MaterialAlertDialogBuilder
 import com.google.android.material.snackbar.Snackbar
-import kotlinx.android.parcel.IgnoredOnParcel
-import kotlinx.android.parcel.Parcelize
-import org.json.JSONArray
-import org.json.JSONObject
+import com.google.gson.annotations.SerializedName
+import io.github.yueeng.hacg.databinding.AlertHostBinding
+import kotlinx.parcelize.IgnoredOnParcel
+import kotlinx.parcelize.Parcelize
 import org.jsoup.nodes.Element
 import java.io.File
-import java.io.PrintWriter
 import java.util.*
+import kotlin.math.min
 
 
 object HAcg {
     private val SYSTEM_HOST: String = "system.host"
     private val SYSTEM_HOSTS: String = "system.hosts"
 
-    private val config_file: File get() = File(HAcgApplication.instance.filesDir, "config.json")
+    data class HacgConfig(
+            @SerializedName("version") val version: Int,
+            @SerializedName("bbs") val bbs: String,
+            @SerializedName("category") val category: List<Category>,
+            @SerializedName("host") val host: List<String>
+    )
+
+    data class Category(
+            @SerializedName("name") val name: String,
+            @SerializedName("url") val url: String
+    )
+
+    private val configFile: File get() = File(HAcgApplication.instance.filesDir, "config.json")
 
     @Synchronized
-    private fun config_string(): String = if (config_file.exists())
-        config_file.readText()
-    else HAcgApplication.instance.assets.open("config.json").use { s ->
-        s.reader().use { it.readText() }
-    }
-
-    @Synchronized
-    private fun default_config(): JSONObject? = try {
-        JSONObject(config_string())
+    private fun defaultConfig(): HacgConfig? = try {
+        val str = if (configFile.exists())
+            configFile.readText()
+        else HAcgApplication.instance.assets.open("config.json").use { s ->
+            s.reader().use { it.readText() }
+        }
+        gson.fromJson(str, HacgConfig::class.java)
     } catch (_: Exception) {
         null
     }
 
-    private fun default_hosts(cfg: JSONObject? = null): Sequence<String> = try {
-        (cfg ?: default_config())!!.getJSONArray("host").let { json ->
-            (0 until json.length()).asSequence().map { json.getString(it) }
-        }
+    private fun defaultHosts(cfg: HacgConfig? = null): List<String> = try {
+        (cfg ?: defaultConfig())!!.host
     } catch (_: Exception) {
-        sequenceOf("www.hacg.me")
+        listOf("www.hacg.me")
     }
 
-    private fun default_category(cfg: JSONObject? = null): Sequence<Pair<String, String>> = try {
-        (cfg ?: default_config())!!.getJSONArray("category").let { a ->
-            (0 until a.length()).asSequence().map { a.getJSONObject(it) }.map { it.getString("url") to it.getString("name") }
-        }
+    private fun defaultCategory(cfg: HacgConfig? = null): List<Pair<String, String>> = try {
+        (cfg ?: defaultConfig())!!.category.map { it.url to it.name }
     } catch (_: Exception) {
-        sequenceOf()
+        listOf()
     }
 
-    private fun default_bbs(cfg: JSONObject? = null): String = try {
-        (cfg ?: default_config())!!.getString("bbs")
+    private fun defaultBbs(cfg: HacgConfig? = null): String = try {
+        (cfg ?: defaultConfig())!!.bbs
     } catch (_: Exception) {
         "/wp/bbs"
     }
@@ -68,70 +73,60 @@ object HAcg {
     private val config = PreferenceManager.getDefaultSharedPreferences(HAcgApplication.instance).also { c ->
         val avc = "app.version.code"
         if (c.getInt(avc, 0) < BuildConfig.VERSION_CODE) {
-            c.edit()
-                    .remove(SYSTEM_HOST)
+            c.edit().remove(SYSTEM_HOST)
                     .remove(SYSTEM_HOSTS)
                     .putInt(avc, BuildConfig.VERSION_CODE)
                     .apply()
-            config_file.delete()
+            configFile.delete()
         }
     }
 
-    private var save_hosts: Sequence<String>
+    private var saveHosts: List<String>
         get() = try {
             config.getString(SYSTEM_HOSTS, null).let { s ->
-                JSONArray(s).let { a -> (0 until a.length()).asSequence().map { k -> a.getString(k) } }
+                gson.fromJson(s, Array<String>::class.java).toList()
             }
         } catch (_: Exception) {
-            sequenceOf()
+            listOf()
         }
         set(hosts): Unit = config.edit().also { c ->
             c.remove(SYSTEM_HOSTS)
             if (hosts.any())
-                c.remove(SYSTEM_HOSTS).putString(SYSTEM_HOSTS, hosts.distinct().fold(JSONArray()) { j, i -> j.put(i) }.toString())
+                c.remove(SYSTEM_HOSTS).putString(SYSTEM_HOSTS, gson.toJson(hosts.distinct()))
         }.apply()
 
-    fun hosts(): Sequence<String> = (save_hosts + default_hosts()).distinct()
-
-    private fun _host(): String? = config.getString(SYSTEM_HOST, null)
+    fun hosts(): List<String> = (saveHosts + defaultHosts()).distinct()
 
     var host: String
-        get() = _host()?.takeIf { it.isNotEmpty() } ?: (hosts().first())
+        get() = config.getString(SYSTEM_HOST, null)?.takeIf { it.isNotEmpty() } ?: (hosts().first())
         set(host): Unit = config.edit().also { c ->
             if (host.isEmpty()) c.remove(SYSTEM_HOST) else c.putString(SYSTEM_HOST, host)
         }.apply()
 
     val bbs: String
-        get() = default_bbs()
+        get() = defaultBbs()
 
-    val categories: Sequence<Pair<String, String>>
-        get() = default_category()
+    val categories: List<Pair<String, String>>
+        get() = defaultCategory()
 
-    init {
-        if (_host().isNullOrEmpty()) host = (hosts().first())
-    }
-
-    fun update(context: Activity, tip: Boolean, f: () -> Unit) {
-        "https://raw.githubusercontent.com/yueeng/hacg/master/app/src/main/assets/config.json".httpGetAsync(context) { html ->
-            when {
-                html == null -> {
-                }
-                html.first != config_string() -> {
-                    context.snack(context.getString(R.string.settings_config_updating), Snackbar.LENGTH_LONG)
-                            .setAction(R.string.settings_config_update) { _ ->
-                                try {
-                                    val config = JSONObject(html.first)
-                                    host = (default_hosts(config).first())
-                                    PrintWriter(config_file).use { it.write(html.first) }
-                                    f()
-                                } catch (_: Exception) {
-                                }
-                            }.show()
-                }
-                else -> {
-                    if (tip) context.toast(R.string.settings_config_newest)
-                }
-            }
+    suspend fun update(context: Activity, tip: Boolean, updated: () -> Unit) {
+        val html = "https://raw.githubusercontent.com/yueeng/hacg/master/app/src/main/assets/config.json".httpGetAwait()
+        val config = try {
+            gson.fromJson(html?.first, HacgConfig::class.java)
+        } catch (_: Exception) {
+            null
+        }
+        when {
+            config == null -> Unit
+            config.version <= defaultConfig()?.version ?: 0 -> if (tip) context.toast(R.string.settings_config_newest)
+            else -> context.snack(context.getString(R.string.settings_config_updating), Snackbar.LENGTH_LONG)
+                    .setAction(R.string.settings_config_update) {
+                        runCatching {
+                            host = defaultHosts(config).first()
+                            configFile.writeText(html!!.first)
+                            updated()
+                        }
+                    }.show()
         }
     }
 
@@ -148,31 +143,29 @@ object HAcg {
     val philosophy: String
         get() = bbs.takeIf { IsHttp.matches(it) }?.let { bbs } ?: "$web$bbs"
 
-    @SuppressLint("InflateParams")
-    fun setHostEdit(context: Context, title: Int, list: () -> Sequence<String>, cur: () -> String, set: (String) -> Unit, ok: (String) -> Unit, reset: () -> Unit) {
-        val view = LayoutInflater.from(context).inflate(R.layout.alert_host, null)
-        val edit = view.findViewById<EditText>(R.id.edit1)
-        edit.inputType = InputType.TYPE_TEXT_VARIATION_URI
-        AlertDialog.Builder(context)
+    val wpdiscuz
+        get() = "$wordpress/wp-content/plugins/wpdiscuz/utils/ajax/wpdiscuz-ajax.php"
+
+    fun setHostEdit(context: Context, title: Int, list: () -> List<String>, cur: () -> String, set: (String) -> Unit, ok: (String) -> Unit, reset: () -> Unit) {
+        val view = AlertHostBinding.inflate(LayoutInflater.from(context))
+        MaterialAlertDialogBuilder(context)
                 .setTitle(title)
-                .setView(view)
+                .setView(view.root)
                 .setNegativeButton(R.string.app_cancel, null)
                 .setOnDismissListener { setHostList(context, title, list, cur, set, ok, reset) }
                 .setNeutralButton(R.string.settings_host_reset) { _, _ -> reset() }
                 .setPositiveButton(R.string.app_ok) { _, _ ->
-                    val host = edit.text.toString()
-                    if (host.isNotEmpty()) {
-                        ok(host)
-                    }
+                    val host = view.edit1.text.toString()
+                    if (host.isNotEmpty()) ok(host)
                 }
                 .create().show()
     }
 
-    fun setHostList(context: Context, title: Int, list: () -> Sequence<String>, cur: () -> String, set: (String) -> Unit, ok: (String) -> Unit, reset: () -> Unit) {
+    fun setHostList(context: Context, title: Int, list: () -> List<String>, cur: () -> String, set: (String) -> Unit, ok: (String) -> Unit, reset: () -> Unit) {
         val hosts = list().toList()
-        AlertDialog.Builder(context)
+        MaterialAlertDialogBuilder(context)
                 .setTitle(title)
-                .setSingleChoiceItems(hosts.map { it as CharSequence }.toTypedArray(), hosts.indexOf(cur()).takeIf { it >= 0 }
+                .setSingleChoiceItems(hosts.toTypedArray(), hosts.indexOf(cur()).takeIf { it >= 0 }
                         ?: 0, null)
                 .setNegativeButton(R.string.app_cancel, null)
                 .setNeutralButton(R.string.settings_host_more) { _, _ -> setHostEdit(context, title, list, cur, set, ok, reset) }
@@ -189,9 +182,40 @@ object HAcg {
                     host = it
                     ok(host)
                 },
-                { host -> save_hosts = (save_hosts + host) },
-                { save_hosts = (sequenceOf()) }
+                { host -> saveHosts = (saveHosts + host) },
+                { saveHosts = (listOf()) }
         )
+    }
+}
+
+data class Version(val ver: List<Int>) {
+    operator fun compareTo(other: Version): Int {
+        val v1 = ver
+        val v2 = other.ver
+        for (i in 0 until min(v1.size, v2.size)) {
+            val v = v1[i] - v2[i]
+            when {
+                v > 0 -> return 1
+                v < 0 -> return -1
+            }
+        }
+        return when {
+            v1.size > v2.size && v1.drop(v2.size).any { it != 0 } -> 1
+            v1.size < v2.size && v2.drop(v1.size).any { it != 0 } -> -1
+            else -> 0
+        }
+    }
+
+    override fun toString(): String = ver.joinToString(".")
+
+    constructor(ver: String) : this(ver.split('.').map { it.toInt() })
+
+    companion object {
+        fun from(ver: String?) = try {
+            ver?.let { Version(ver) }
+        } catch (_: Exception) {
+            null
+        }
     }
 }
 
@@ -202,128 +226,81 @@ data class Tag(val name: String, val url: String) : Parcelable {
 }
 
 @Parcelize
-data class Comment(val id: String, val content: String, val user: String, val face: String,
-                   val moderation: String, val time: Date?, val children: MutableList<Comment>, val depth: Int = 1) : Parcelable {
+data class Comment(val id: Int, val parent: Int, val content: String, val user: String, val face: String,
+                   var moderation: Int, val time: String, val children: MutableList<Comment>, val depth: Int = 1) : Parcelable {
     companion object {
-        val ID: Regex = """wc-comm-(\d+_\d+)""".toRegex()
+        val ID: Regex = """wpd-comm-(\d+)_(\d+)""".toRegex()
     }
 
+    val uniqueId: String get() = "${id}_$parent"
+
     constructor(e: Element, depth: Int = 1) :
-            this(ID.find(e.attr("id"))?.let { it.groups[1]?.value } ?: "0_0",
-                    e.select(">.wc-comment-right .wc-comment-text").text(),
-                    e.select(">.wc-comment-right .wc-comment-author").text(),
-                    e.select(">.wc-comment-left .avatar").attr("abs:src"),
-                    ""/*e.select(">.wc-comment-right .wc-vote-result").text()*/,
-                    e.select(">.wc-comment-right .wc-comment-date").text().toDate(datefmtcn),
-                    e.select(">.wc-comment-right~.wc-reply").map { Comment(it, depth + 1) }.toMutableList(),
+            this(ID.find(e.attr("id"))?.let { it.groups[1]?.value }?.toInt() ?: 0,
+                    ID.find(e.attr("id"))?.let { it.groups[2]?.value }?.toInt() ?: 0,
+                    e.select(">.wpd-comment-wrap .wpd-comment-text").text(),
+                    e.select(">.wpd-comment-wrap .wpd-comment-author").text(),
+                    e.select(">.wpd-comment-wrap .avatar").attr("abs:src"),
+                    e.select(">.wpd-comment-wrap .wpd-vote-result").text().toIntOrNull() ?: 0,
+                    e.select(">.wpd-comment-wrap .wpd-comment-date").text(),
+                    e.select(">.wpd-comment-wrap~.wpd-reply").map { Comment(it, depth + 1) }.toMutableList(),
                     depth
             )
 }
 
+@Parcelize
 data class JComment(
-        val last_parent_id: String,
-        val is_show_load_more: Boolean,
-        val comment_list: String,
-        val loadLastCommentId: String,
-        val callbackFunctions: List<Any?>
-)
+        @SerializedName("last_parent_id") val lastParentId: String,
+        @SerializedName("is_show_load_more") val isShowLoadMore: Boolean,
+        @SerializedName("comment_list") val commentList: String?,
+        @SerializedName("loadLastCommentId") val loadLastCommentId: String
+) : Parcelable
 
+@Parcelize
+data class JWpdiscuzComment(
+        @SerializedName("success") val success: Boolean,
+        @SerializedName("data") val data: JComment
+) : Parcelable
+
+@Parcelize
 data class JCommentResult(
-        val authorsCount: Int,
-        val callbackFunctions: List<Any>,
-        val code: String,
-        val comment_author: String,
-        val comment_author_email: String,
-        val comment_author_url: String,
-        val held_moderate: Int,
-        val is_in_same_container: String,
-        val is_main: Int,
-        val message: String,
-        val new_comment_id: Int,
-        val redirect: String,
-        val repliesCount: Int,
-        val threadsCount: Int,
-        val wc_all_comments_count_new: String
-)
+        @SerializedName("code") val code: String,
+        @SerializedName("comment_author") val commentAuthor: String,
+        @SerializedName("comment_author_email") val commentAuthorEmail: String,
+        @SerializedName("comment_author_url") val commentAuthorUrl: String,
+        @SerializedName("held_moderate") val held_moderate: Int,
+        @SerializedName("is_in_same_container") val isInSameContainer: String,
+        @SerializedName("is_main") val is_main: Int,
+        @SerializedName("message") val message: String,
+        @SerializedName("new_comment_id") val newCommentId: Int,
+        @SerializedName("redirect") val redirect: Int,
+        @SerializedName("uniqueid") val uniqueid: String,
+        @SerializedName("wc_all_comments_count_new") val wcAllCommentsCountNew: String,
+        @SerializedName("wc_all_comments_count_new_html") val wcAllCommentsCountNewHtml: String
+) : Parcelable
 
-data class Wpdiscuz(
-        val customAjaxUrl: String,
-        val url: String,
-        val wpdiscuz_options: WpdiscuzOptions
-)
+@Parcelize
+data class JWpdiscuzCommentResult(
+        @SerializedName("success") val success: Boolean,
+        @SerializedName("data") val data: JCommentResult
+) : Parcelable
 
-data class WpdiscuzOptions(
-        val ahk: String,
-        val commentListLoadType: String,
-        val commentListUpdateTimer: String,
-        val commentListUpdateType: String,
-        val commentTextMaxLength: Any,
-        val commentsVoteOrder: Boolean,
-        val cookieCommentsSorting: String,
-        val cookiehash: String,
-        val enableDropAnimation: Int,
-        val enableFbLogin: Int,
-        val enableFbShare: Int,
-        val enableGoogleLogin: Int,
-        val enableLastVisitCookie: Int,
-        val facebookAppID: String,
-        val facebookUseOAuth2: Int,
-        val googleAppID: String,
-        val isCaptchaInSession: Boolean,
-        val isCookiesEnabled: Boolean,
-        val isGoodbyeCaptchaActive: Boolean,
-        val isLoadOnlyParentComments: Int,
-        val isNativeAjaxEnabled: Int,
-        val is_email_field_required: Int,
-        val is_user_logged_in: Boolean,
-        val lastVisitKey: String,
-        val liveUpdateGuests: String,
-        val loadLastCommentId: Int,
-        val socialLoginAgreementCheckbox: Int,
-        val storeCommenterData: Int,
-        val version: String,
-        val wc_captcha_show_for_guest: String,
-        val wc_captcha_show_for_members: String,
-        val wc_comment_bg_color: String,
-        val wc_comment_edit_not_possible: String,
-        val wc_comment_not_edited: String,
-        val wc_comment_not_updated: String,
-        val wc_deny_voting_from_same_ip: String,
-        val wc_error_email_text: String,
-        val wc_error_empty_text: String,
-        val wc_error_url_text: String,
-        val wc_follow_canceled: String,
-        val wc_follow_email_confirm: String,
-        val wc_follow_email_confirm_fail: String,
-        val wc_follow_impossible: String,
-        val wc_follow_login_to_follow: String,
-        val wc_follow_not_added: String,
-        val wc_follow_success: String,
-        val wc_follow_user: String,
-        val wc_held_for_moderate: String,
-        val wc_hide_replies_text: String,
-        val wc_invalid_captcha: String,
-        val wc_invalid_field: String,
-        val wc_login_to_vote: String,
-        val wc_msg_input_max_length: String,
-        val wc_msg_input_min_length: String,
-        val wc_msg_required_fields: String,
-        val wc_new_comment_button_text: String,
-        val wc_new_comments_button_text: String,
-        val wc_new_replies_button_text: String,
-        val wc_new_reply_button_text: String,
-        val wc_post_id: Int,
-        val wc_reply_bg_color: String,
-        val wc_self_vote: String,
-        val wc_show_replies_text: String,
-        val wc_unfollow_user: String,
-        val wc_vote_only_one_time: String,
-        val wc_voting_error: String,
-        val wordpressIsPaginate: String,
-        val wordpressThreadCommentsDepth: String,
-        val wpdiscuzCommentOrderBy: String,
-        val wpdiscuzCommentsOrder: String
-)
+@Parcelize
+data class JWpdiscuzVote(
+        @SerializedName("success") val success: Boolean,
+        @SerializedName("data") val data: String
+) : Parcelable
+
+@Parcelize
+data class JWpdiscuzVoteSucceed(
+        @SerializedName("success") val success: Boolean,
+        @SerializedName("data") val data: JWpdiscuzVoteSucceedData
+) : Parcelable
+
+@Parcelize
+data class JWpdiscuzVoteSucceedData(
+        @SerializedName("buttonsStyle") val buttonsStyle: String,
+        @SerializedName("votes") val votes: String
+) : Parcelable
 
 @Parcelize
 data class Article(val id: Int, val title: String,
@@ -337,6 +314,13 @@ data class Article(val id: Int, val title: String,
                    val tags: List<Tag>) : Parcelable {
     companion object {
         val ID: Regex = """post-(\d+)""".toRegex()
+        fun parseID(str: String?) = str?.let { s -> ID.find(s)?.let { it.groups[1]?.value?.toInt() } }
+        private val URL: Regex = """/wp/(\d+)\.html""".toRegex()
+        fun getIdFromUrl(str: String?) = str?.let { s -> URL.find(s)?.let { it.groups[1]?.value?.toInt() } }
+        private val LIST = listOf("/wp/tag/", "/wp/author/", "/wp/?s=")
+        fun isList(url: String): Boolean = Uri.parse(url).path?.let { path ->
+            HAcg.categories.any { path == it.first } || LIST.any { path.startsWith(it) }
+        } ?: false
     }
 
     constructor(msg: String) : this(0, msg, null, null, null, null, 0, null, null, listOf())
@@ -352,16 +336,95 @@ data class Article(val id: Int, val title: String,
     val expend: List<Tag> by lazy { (tags + category + author).mapNotNull { it } }
 
     constructor(e: Element) :
-            this(ID.find(e.attr("id"))?.let { it.groups[1]?.value?.toInt() } ?: 0,
-                    e.select("header .entry-title a").text().trim(),
-                    e.select("header .entry-title a").attr("abs:href"),
+            this(parseID(e.attr("id")) ?: 0,
+                    e.select("header .entry-title").text().trim(),
+                    e.select("header .entry-title,.entry-meta a").attr("abs:href"),
                     e.select(".entry-content img").let { img ->
                         img.takeIf { it.hasClass("avatar") }?.let { "" } ?: img.attr("abs:src")
                     },
-                    e.select(".entry-content p,.entry-summary p").text().trim(),
+                    e.select(".entry-content p,.entry-summary p").firstOrNull()?.text()?.trim(),
                     e.select("time").attr("datetime").toDate(),
                     e.select("header .comments-link").text().trim().toIntOrNull() ?: 0,
-                    e.select("header .author a").take(1).map { Tag(it) }.firstOrNull(),
+                    e.select(".author a").take(1).map { Tag(it) }.firstOrNull(),
                     e.select("footer .cat-links a").take(1).map { Tag(it) }.firstOrNull(),
                     e.select("footer .tag-links a").map { Tag(it) }.toList())
 }
+
+data class JGitHubRelease(
+        @SerializedName("assets") val assets: List<JGitHubReleaseAsset>,
+        @SerializedName("assets_url") val assetsUrl: String,
+        @SerializedName("author") val author: JGitHubReleaseAuthor,
+        @SerializedName("body") val body: String,
+        @SerializedName("created_at") val createdAt: String,
+        @SerializedName("draft") val draft: Boolean,
+        @SerializedName("html_url") val htmlUrl: String,
+        @SerializedName("id") val id: Int,
+        @SerializedName("name") val name: String,
+        @SerializedName("node_id") val nodeId: String,
+        @SerializedName("prerelease") val prerelease: Boolean,
+        @SerializedName("published_at") val publishedAt: String,
+        @SerializedName("tag_name") val tagName: String,
+        @SerializedName("tarball_url") val tarballUrl: String,
+        @SerializedName("target_commitish") val targetCommitish: String,
+        @SerializedName("upload_url") val uploadUrl: String,
+        @SerializedName("url") val url: String,
+        @SerializedName("zipball_url") val zipballUrl: String
+)
+
+data class JGitHubReleaseAsset(
+        @SerializedName("browser_download_url") val browserDownloadUrl: String,
+        @SerializedName("content_type") val contentType: String,
+        @SerializedName("created_at") val createdAt: String,
+        @SerializedName("download_count") val downloadCount: Int,
+        @SerializedName("id") val id: Int,
+        @SerializedName("label") val label: Any,
+        @SerializedName("name") val name: String,
+        @SerializedName("node_id") val nodeId: String,
+        @SerializedName("size") val size: Int,
+        @SerializedName("state") val state: String,
+        @SerializedName("updated_at") val updatedAt: String,
+        @SerializedName("uploader") val uploader: JGitHubReleaseUploader,
+        @SerializedName("url") val url: String
+)
+
+data class JGitHubReleaseAuthor(
+        @SerializedName("avatar_url") val avatarUrl: String,
+        @SerializedName("events_url") val eventsUrl: String,
+        @SerializedName("followers_url") val followersUrl: String,
+        @SerializedName("following_url") val followingUrl: String,
+        @SerializedName("gists_url") val gistsUrl: String,
+        @SerializedName("gravatar_id") val gravatarId: String,
+        @SerializedName("html_url") val htmlUrl: String,
+        @SerializedName("id") val id: Int,
+        @SerializedName("login") val login: String,
+        @SerializedName("node_id") val nodeId: String,
+        @SerializedName("organizations_url") val organizationsUrl: String,
+        @SerializedName("received_events_url") val receivedEventsUrl: String,
+        @SerializedName("repos_url") val reposUrl: String,
+        @SerializedName("site_admin") val siteAdmin: Boolean,
+        @SerializedName("starred_url") val starredUrl: String,
+        @SerializedName("subscriptions_url") val subscriptionsUrl: String,
+        @SerializedName("type") val type: String,
+        @SerializedName("url") val url: String
+)
+
+data class JGitHubReleaseUploader(
+        @SerializedName("avatar_url") val avatarUrl: String,
+        @SerializedName("events_url") val eventsUrl: String,
+        @SerializedName("followers_url") val followersUrl: String,
+        @SerializedName("following_url") val followingUrl: String,
+        @SerializedName("gists_url") val gistsUrl: String,
+        @SerializedName("gravatar_id") val gravatarId: String,
+        @SerializedName("html_url") val htmlUrl: String,
+        @SerializedName("id") val id: Int,
+        @SerializedName("login") val login: String,
+        @SerializedName("node_id") val nodeId: String,
+        @SerializedName("organizations_url") val organizationsUrl: String,
+        @SerializedName("received_events_url") val receivedEventsUrl: String,
+        @SerializedName("repos_url") val reposUrl: String,
+        @SerializedName("site_admin") val siteAdmin: Boolean,
+        @SerializedName("starred_url") val starredUrl: String,
+        @SerializedName("subscriptions_url") val subscriptionsUrl: String,
+        @SerializedName("type") val type: String,
+        @SerializedName("url") val url: String
+)

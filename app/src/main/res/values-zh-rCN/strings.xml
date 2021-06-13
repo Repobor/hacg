@@ -10,7 +10,10 @@
     <string name="app_exit_confirm">要退出吗？</string>
     <string name="app_list_complete">没有更多了</string>
     <string name="app_list_empty">列表空</string>
+    <string name="app_list_failed">加载失败</string>
     <string name="app_list_loading">加载中…</string>
+    <string name="app_list_loadmore">加载更多</string>
+    <string name="app_list_time">发表于%1$s由%2$s|%3$d条回复</string>
     <string name="app_magnet">链接</string>
     <string name="app_name">琉璃神社</string>
     <string name="app_network_retry">请求失败，点击黑猫重试，或从菜单更换域名。</string>
@@ -27,6 +30,8 @@
     <string name="app_update_check">检查更新</string>
     <string name="app_update_new">从 %1$s 升级到 %2$s。</string>
     <string name="app_update_none">版本 %1$s 已经是最新版本。</string>
+    <string name="app_user">用户信息</string>
+    <string name="app_user_login">登录</string>
 
     <string name="comment_author">姓名</string>
     <string name="comment_content">评论内容</string>
@@ -35,6 +40,10 @@
     <string name="comment_refresh">刷新</string>
     <string name="comment_review">回复</string>
     <string name="comment_review_to">回复: %1$s</string>
+    <string name="comment_sort">评论排序</string>
+    <string name="comment_sort_newest">最新的评论</string>
+    <string name="comment_sort_oldest">最旧的评论</string>
+    <string name="comment_sort_vote">得票最多的评论</string>
     <string name="comment_submit">提交</string>
     <string name="comment_succeeded">提交成功</string>
     <string name="comment_title">评论</string>
